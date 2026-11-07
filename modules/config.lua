@@ -32,6 +32,34 @@ function config.tryLoadFile(path)
     return data
 end
 
+--- Content of a file, nil if it cannot be opened
+---@param path string
+---@return string?
+function config.readText(path)
+    -- Binary: the text is kept byte for byte (line endings included)
+    local file = io.open(path, "rb")
+    if not file then return nil end
+
+    local content = file:read("*a")
+    file:close()
+    return content
+end
+
+---@param path string
+---@param text string
+---@return boolean
+function config.writeText(path, text)
+    local file = io.open(path, "wb")
+    if not file then
+        print(string.format("[RemovalEditor] Error: %s cannot be written!", path))
+        return false
+    end
+
+    file:write(text)
+    file:close()
+    return true
+end
+
 function config.loadFile(path)
     local data, err = config.tryLoadFile(path)
     if err then

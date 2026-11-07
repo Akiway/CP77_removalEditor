@@ -2,8 +2,17 @@ local config = require("modules/config")
 local utils = require("modules/utils")
 local GameUI = require("modules/GameUI")
 local style = require("modules/style")
+local yaml = require("modules/yaml")
 
 local target = nil
+
+-- Order of the keys written to a YAML preset, for the keys its file did not have
+local presetKeyOrder = {
+    "streaming", "sectors", "path", "expectedNodes", "nodeDeletions", "nodeMutations",
+    "index", "type", "note", "debugName", "resource", "nodeRef", "position", "orientation",
+    "expectedActors", "actorDeletions", "expectedInstances", "instanceDeletions",
+    "nodeRefHash", "nbNodesUnderProxyDiff", "proxyHash", "proxyDiff", "x", "y", "z", "w", "i", "j", "k", "r"
+}
 
 --- Parts of a node that ArchiveXL can remove one by one, and the node types that have them.
 --- Since 2.5 the collisions of a sector are cooked into worldCookedCollisionNode: one nodeData entry per former collision node.
@@ -146,6 +155,7 @@ end
 ---@field position table
 ---@field orientation table
 ---@field debugName string
+---@field note string?
 
 ---@class proxyMutation
 ---@field type string
@@ -157,17 +167,21 @@ local removal = {
     runtimeData = {
         cetOpen = false,
         rhtInstalled = false,
+        gameVersion = nil -- e.g. "2.5"
     },
 
     uiData = {
         newPresetName = "",
         switchToEdit = false,
-        pendingDelete = nil
+        pendingDelete = nil,
+        pendingInstall = nil,
+        stagedTarget = nil, -- Node the staged note was written for
+        stagedNote = ""
     },
 
     presets = {},
+    presetInfo = {}, -- File name -> { format = "json" | "yaml" }
     invalidPresets = {}, -- File name -> reason it cannot be loaded
-    notes = {},
     currentFile = "",
     directAdd = true,
     searchText = "",
@@ -183,12 +197,25 @@ function removal:getEditFlag()
     return ImGuiTabItemFlags.None
 end
 
---- Loads a preset file, nil and the reason if it cannot be used
+--- Loads a preset file (JSON or YAML), nil and the reason if it cannot be used
 ---@param name string
----@return table?, string?
+---@return table? preset
+---@return table|string info { format, source } or the reason it cannot be loaded
 local function loadPreset(name)
-    local preset, err = config.tryLoadFile("data/" .. name)
-    if not preset then return nil, err end
+    local text = config.readText("data/" .. name)
+    if not text then return nil, "cannot be opened" end
+
+    local format = text:match("^\239?\187?\191?%s*[{%[]") and "json" or "yaml"
+    local ok, preset, err
+    if format == "json" then
+        ok, preset = pcall(json.decode, text)
+        if not ok then return nil, "not valid JSON (" .. tostring(preset) .. ")" end
+    else
+        ok, preset, err = pcall(yaml.decode, text)
+        if not ok then return nil, "not valid YAML (" .. tostring(preset) .. ")" end
+        if err then return nil, "not valid YAML (" .. err .. ")" end
+    end
+    if preset == nil then return nil, "empty" end
 
     if type(preset) ~= "table" or type(preset.streaming) ~= "table" or type(preset.streaming.sectors) ~= "table" then
         return nil, "no streaming.sectors list"
@@ -200,9 +227,101 @@ local function loadPreset(name)
         end
         sector.nodeDeletions = sector.nodeDeletions or {}
         sector.nodeMutations = sector.nodeMutations or {}
+        if type(sector.nodeDeletions) ~= "table" or type(sector.nodeMutations) ~= "table" then
+            return nil, "nodeDeletions / nodeMutations of " .. sector.path .. " is not a list"
+        end
+        for _, entry in pairs(sector.nodeDeletions) do
+            if type(entry) ~= "table" then
+                return nil, "a removal of " .. sector.path .. " is not a 'key: value' list"
+            end
+        end
     end
 
-    return preset
+    return preset, { format = format }
+end
+
+--- Writes a preset to its file, in the format it was read in (new presets are YAML). A YAML preset keeps its comments.
+---@param name string
+---@return boolean
+function removal:savePreset(name)
+    local preset = self.presets[name]
+    if not preset then return false end
+
+    local info = self.presetInfo[name] or { format = "json" }
+    if info.format ~= "yaml" then
+        return config.saveFile("data/" .. name, preset)
+    end
+
+    return config.writeText("data/" .. name, yaml.encode(preset, { keyOrder = presetKeyOrder }))
+end
+
+-- Line of the header of a YAML preset that gives the game version it was made for
+local gameVersionPattern = "^#%s*[Gg]ame [Vv]ersion%s*:%s*(.-)%s*$"
+
+--- Game version a preset was made for ("# Game version: 2.5" at the start of a YAML preset), nil if it does not say
+---@param preset table
+---@return string?
+local function getPresetGameVersion(preset)
+    for _, line in ipairs(yaml.getHeader(preset)) do
+        local version = line:match(gameVersionPattern)
+        if version and version ~= "" then return version end
+    end
+end
+
+--- Sets the "# Game version: ..." line of a YAML preset's header, the other lines stay
+---@param preset table
+---@param version string
+local function setPresetGameVersion(preset, version)
+    local header = yaml.getHeader(preset)
+    local found = false
+    for i, line in ipairs(header) do
+        if line:match(gameVersionPattern) then
+            header[i] = "# Game version: " .. version
+            found = true
+        end
+    end
+    if not found then
+        header[#header + 1] = "# Game version: " .. version
+    end
+    yaml.setHeader(preset, header)
+end
+
+--- nil if the preset was made for the running game version, else its version or "unknown"
+---@param preset table
+---@return string?
+function removal:getOutdatedVersion(preset)
+    local current = self.runtimeData.gameVersion
+    if not current then return nil end
+
+    local version = getPresetGameVersion(preset)
+    if version == current then return nil end
+    return version or "unknown"
+end
+
+function removal:drawVersionWarning(name, preset)
+    local version = self:getOutdatedVersion(preset)
+    if not version then return end
+
+    local current = self.runtimeData.gameVersion
+    -- The version is a comment, which JSON cannot hold
+    local isYaml = (self.presetInfo[name] or {}).format == "yaml"
+
+    ImGui.PushStyleColor(ImGuiCol.Text, 0xff30b0ff)
+    if version == "unknown" then
+        ImGui.TextWrapped(string.format("Game version unknown%s: if this preset was made before %s, its node indices are probably wrong. Convert it with ArchiveXL Sector Updater.",
+            isYaml and "" or " (a JSON preset cannot record it)", current))
+    else
+        ImGui.TextWrapped(string.format("Made for %s, the game is %s: node indices may have changed. Convert it with ArchiveXL Sector Updater.", version, current))
+    end
+    ImGui.PopStyleColor()
+
+    if not isYaml then return end
+
+    if ImGui.Button("Mark as made for " .. current) then
+        setPresetGameVersion(preset, current)
+        self:savePreset(name)
+    end
+    utils.tooltip("Writes \"# Game version: " .. current .. "\" at the start of the file, once its nodes have been checked or converted for " .. current .. ".")
 end
 
 --- Keeps the loaded presets in sync with the .xl files of the data folder
@@ -213,12 +332,13 @@ function removal:refreshPresets()
             files[file.name] = true
 
             if not self.presets[file.name] and not self.invalidPresets[file.name] then
-                local preset, err = loadPreset(file.name)
+                local preset, info = loadPreset(file.name)
                 if preset then
                     self.presets[file.name] = preset
+                    self.presetInfo[file.name] = info
                 else
-                    self.invalidPresets[file.name] = err
-                    print(string.format("[RemovalEditor] Error: Preset \"%s\" cannot be loaded: %s", file.name, err))
+                    self.invalidPresets[file.name] = info
+                    print(string.format("[RemovalEditor] Error: Preset \"%s\" cannot be loaded: %s", file.name, info))
                 end
             end
         end
@@ -228,6 +348,7 @@ function removal:refreshPresets()
     for name, _ in pairs(self.presets) do
         if not files[name] then
             self.presets[name] = nil
+            self.presetInfo[name] = nil
             if self.currentFile == name then self.currentFile = "" end
         end
     end
@@ -248,7 +369,15 @@ function removal:drawPresetUI()
     style.pushGreyedOut(not validName)
 
     if ImGui.Button("Create") and validName then
-        config.tryCreateConfig("data/" .. self.uiData.newPresetName .. ".xl", {streaming = {sectors = {}}})
+        -- YAML, so that the game version can be written in its header
+        local path = "data/" .. self.uiData.newPresetName .. ".xl"
+        if not config.fileExists(path) then
+            local preset = { streaming = { sectors = {} } }
+            if self.runtimeData.gameVersion then
+                setPresetGameVersion(preset, self.runtimeData.gameVersion)
+            end
+            config.writeText(path, yaml.encode(preset, { keyOrder = presetKeyOrder }))
+        end
         self.uiData.newPresetName = ""
     end
 
@@ -263,8 +392,11 @@ function removal:drawPresetUI()
             style.drawProp("Sectors", #preset.streaming.sectors)
             style.drawProp("Removals", utils.getTotalRemovals(preset))
             style.drawProp("Mutations", utils.getTotalMutations(preset))
+            style.drawProp("Game Version", getPresetGameVersion(preset) or "unknown")
+            style.drawProp("Format", (self.presetInfo[name] or {}).format == "yaml" and "YAML" or "JSON")
 
             ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, 5, 2)
+            self:drawVersionWarning(name, preset)
 
             if ImGui.Button("Edit") then
                 self.currentFile = name
@@ -276,6 +408,7 @@ function removal:drawPresetUI()
                 if ImGui.Button("Confirm delete") then
                     os.remove("data/" .. name)
                     self.presets[name] = nil
+                    self.presetInfo[name] = nil
                     self.uiData.pendingDelete = nil
                     if self.currentFile == name then
                         self.currentFile = ""
@@ -291,17 +424,29 @@ function removal:drawPresetUI()
             ImGui.SameLine()
 
             local inGame = IsDefined(GetPlayer())
+            -- A preset made for another game version is only installed on a second click
+            local outdated = self:getOutdatedVersion(preset) ~= nil
+            local confirming = outdated and self.uiData.pendingInstall == name
             style.pushGreyedOut(not inGame)
-            if ImGui.Button("Install & Reload") and inGame then
-                RedHotTools.HotInstall(string.format("bin\\x64\\plugins\\cyber_engine_tweaks\\mods\\removalEditor\\data\\%s", name))
-                self.reloadTransform.position = GetPlayer():GetWorldPosition()
-                self.reloadTransform.rotation = GetPlayer():GetWorldOrientation():ToEulerAngles()
-                self.reload = true
+            if ImGui.Button(confirming and "Install anyway" or "Install & Reload") and inGame then
+                if outdated and not confirming then
+                    self.uiData.pendingInstall = name
+                else
+                    self.uiData.pendingInstall = nil
+                    RedHotTools.HotInstall(string.format("bin\\x64\\plugins\\cyber_engine_tweaks\\mods\\removalEditor\\data\\%s", name))
+                    self.reloadTransform.position = GetPlayer():GetWorldPosition()
+                    self.reloadTransform.rotation = GetPlayer():GetWorldOrientation():ToEulerAngles()
+                    self.reload = true
 
-                Game.GetSystemRequestsHandler():LoadLastCheckpoint(true)
+                    Game.GetSystemRequestsHandler():LoadLastCheckpoint(true)
+                end
             end
             style.popGreyedOut(not inGame)
-            utils.tooltip("Installs the preset and reloads the last save. Make a Quick-Save first, to keep your progress and speed up the reload.")
+            if confirming then
+                utils.tooltip("This preset was not made for this game version: ArchiveXL may remove the wrong objects.")
+            else
+                utils.tooltip("Installs the preset and reloads the last save. Make a Quick-Save first, to keep your progress and speed up the reload.")
+            end
             ImGui.PopStyleVar(1)
 
             ImGui.TreePop()
@@ -383,13 +528,13 @@ function removal:drawElements(preset, entry, kind)
     utils.tooltip("Remove the node with all its " .. string.lower(kind.label) .. ", instead of a selection of them.")
 
     if changed then
-        config.saveFile("data/" .. self.currentFile, preset)
+        self:savePreset(self.currentFile)
     end
 
     ImGui.TreePop()
 end
 
---- Key of a node in notes.json, e.g. "exterior_-7_6_0_2_540"
+--- Key of a node in the former notes.json, e.g. "exterior_-7_6_0_2_540"
 ---@param sectorPath string
 ---@param index number
 ---@return string
@@ -397,17 +542,88 @@ local function getNoteKey(sectorPath, index)
     return utils.getSectorName(sectorPath) .. "_" .. tostring(index)
 end
 
-function removal:drawNoteInput(id, sectorPath, index)
+---@param id string
+---@param note string?
+---@return string note, boolean changed
+function removal:drawNoteInput(id, note)
     ImGui.PushStyleColor(ImGuiCol.Text, 0xff9f9f9f)
     ImGui.TextWrapped("Note:")
     ImGui.PopStyleColor()
     ImGui.SameLine()
 
-    local key = getNoteKey(sectorPath, index)
-    local text, changed = ImGui.InputTextWithHint(id, "Note...", self.notes[key] or "", 100)
-    if changed then
-        self.notes[key] = #text > 0 and text or nil
-        config.saveFile("data/notes.json", self.notes)
+    return ImGui.InputTextWithHint(id, "Note...", note or "", 100)
+end
+
+--- Notes are kept in the removals of the presets ("note" field, ignored by ArchiveXL), so that they follow their node
+--- when a preset is converted to another game version. notes.json, which identified a node by sector and index, is
+--- moved into the presets once.
+function removal:migrateNotes()
+    if not config.fileExists("data/notes.json") then return end
+
+    local notes, err = config.tryLoadFile("data/notes.json")
+    if type(notes) ~= "table" then
+        os.rename("data/notes.json", "data/notes.invalid.json")
+        print(string.format("[RemovalEditor] Error: notes.json cannot be loaded (%s), it was renamed to notes.invalid.json.", tostring(err)))
+        return
+    end
+
+    self:refreshPresets()
+
+    local moved, changedPresets, used = 0, 0, {}
+    for name, preset in pairs(self.presets) do
+        local changed = false
+        for _, sector in pairs(preset.streaming.sectors) do
+            for _, entry in pairs(sector.nodeDeletions) do
+                local key = getNoteKey(sector.path, entry.index)
+                local note = notes[key]
+                if type(note) == "string" and note ~= "" then
+                    used[key] = true
+                    if entry.note == nil or entry.note == "" then
+                        entry.note = note
+                        moved = moved + 1
+                        changed = true
+                    end
+                end
+            end
+        end
+        if changed and self:savePreset(name) then
+            changedPresets = changedPresets + 1
+        end
+    end
+
+    local unused = 0
+    for key, _ in pairs(notes) do
+        if not used[key] then unused = unused + 1 end
+    end
+
+    -- Kept as a backup, without overwriting an older one
+    local backup = "data/notes.migrated.json"
+    local suffix = 1
+    while config.fileExists(backup) do
+        suffix = suffix + 1
+        backup = string.format("data/notes.migrated.%d.json", suffix)
+    end
+    os.rename("data/notes.json", backup)
+
+    print(string.format("[RemovalEditor] Moved %d note(s) from notes.json into %d preset(s), %d note(s) matched no removal. notes.json was kept as %s.",
+        moved, changedPresets, unused, backup:match("[^/]+$")))
+    for name, _ in pairs(self.invalidPresets) do
+        print(string.format("[RemovalEditor] Warning: \"%s\" cannot be loaded, it got no notes. Fix it, then rename %s to notes.json to move them again.", name, backup:match("[^/]+$")))
+    end
+end
+
+--- The removal of a node in the opened preset, if it has one
+---@param nodeData table RHT target data
+---@return removalEntry?
+function removal:findRemoval(nodeData)
+    local preset = self.presets[self.currentFile]
+    if not preset or not nodeData then return nil end
+
+    local sector = utils.findSectorByPath(preset.streaming.sectors, nodeData.sectorPath)
+    if not sector then return nil end
+
+    for _, entry in pairs(sector.nodeDeletions) do
+        if entry.index == nodeData.instanceIndex then return entry end
     end
 end
 
@@ -446,7 +662,19 @@ function removal:drawDirectTarget()
                 (element and tostring(element) or "All") .. " / " .. (count and tostring(count) or "?"))
         end
 
-        self:drawNoteInput("##noteAdd", target.sectorPath, target.instanceIndex)
+        -- Note of its removal if the node is already in the preset, else kept until the node is added
+        local entry = self:findRemoval(target)
+        local staged = self.uiData.stagedTarget == target and self.uiData.stagedNote or ""
+        local note, changed = self:drawNoteInput("##noteAdd", entry and entry.note or staged)
+        if changed then
+            if entry then
+                entry.note = #note > 0 and note or nil
+                self:savePreset(self.currentFile)
+            else
+                self.uiData.stagedTarget = target
+                self.uiData.stagedNote = note
+            end
+        end
     end
 
     ImGui.Spacing()
@@ -465,6 +693,8 @@ function removal:drawEditUI()
         ImGui.Text("No preset loaded.")
         return
     end
+
+    self:drawVersionWarning(self.currentFile, self.presets[self.currentFile])
 
     local mode = "Direct Add [Add directly to preset when clicking button in RHT]"
     if not self.directAdd then
@@ -487,7 +717,7 @@ function removal:drawEditUI()
         end
 
         if added > 0 then
-            config.saveFile("data/" .. self.currentFile, self.presets[self.currentFile])
+            self:savePreset(self.currentFile)
         end
         print(string.format("[RemovalEditor] Added %d scanned node(s), skipped %d (not world nodes, already in the preset or invalid).", added, skipped))
     end
@@ -548,16 +778,21 @@ function removal:drawRemoval(preset, sector, entry)
     style.drawProp("Type", entry.type)
     style.drawProp("Sector Path", sector.path)
     style.drawProp("Node Index", tostring(entry.index) .. "/" .. tostring(sector.expectedNodes))
-    if entry.position then
-        style.drawProp("Position", string.format("X: %.2f Y: %.2f Z: %.2f", entry.position.x, entry.position.y, entry.position.z))
+    -- { x, y, z } from Removal Editor, [x, y, z, w] from other tools
+    local position = type(entry.position) == "table" and entry.position or {}
+    local x, y, z = position.x or position[1], position.y or position[2], position.z or position[3]
+    if type(x) == "number" and type(y) == "number" and type(z) == "number" then
+        style.drawProp("Position", string.format("X: %.2f Y: %.2f Z: %.2f", x, y, z))
     end
-    if entry.debugName ~= "" then
+    -- Written by other tools too: only shown when they are text
+    local function isText(value) return (type(value) == "string" and value ~= "") or type(value) == "number" end
+    if isText(entry.debugName) then
         style.drawProp("Debug Name", entry.debugName)
     end
-    if entry.resource ~= "" then
+    if isText(entry.resource) then
         style.drawProp("Resource", entry.resource)
     end
-    if entry.nodeRef ~= "" then
+    if isText(entry.nodeRef) then
         style.drawProp("NodeRef", entry.nodeRef)
     end
 
@@ -566,7 +801,11 @@ function removal:drawRemoval(preset, sector, entry)
         self:drawElements(preset, entry, kind)
     end
 
-    self:drawNoteInput("##noteRemoval", sector.path, entry.index)
+    local note, changed = self:drawNoteInput("##noteRemoval", entry.note)
+    if changed then
+        entry.note = #note > 0 and note or nil
+        self:savePreset(self.currentFile)
+    end
 
     if ImGui.Button("Remove") then
         return false
@@ -793,7 +1032,9 @@ function removal:cleanupPreset(preset)
             end
         end
 
-        if #sector.nodeDeletions == 0 and #sector.nodeMutations == 0 then
+        -- A sector whose YAML still lists entries commented out (e.g. by ArchiveXL Sector Updater) is kept with them
+        if #sector.nodeDeletions == 0 and #sector.nodeMutations == 0
+            and not yaml.hasCommentedEntries(sector.nodeDeletions) and not yaml.hasCommentedEntries(sector.nodeMutations) then
             table.remove(preset.streaming.sectors, sectorKey)
         end
     end
@@ -842,7 +1083,7 @@ function removal:addRemoval(nodeData, save)
 
     local function saveIfWanted()
         if save ~= false then
-            config.saveFile("data/" .. self.currentFile, preset)
+            self:savePreset(self.currentFile)
         end
     end
 
@@ -877,6 +1118,15 @@ function removal:addRemoval(nodeData, save)
         or nodeData.particlePath or nodeData.foliagePath or nodeData.workspotPath or nodeData.recordID or ""
     removal.debugName = nodeData.debugName or ""
 
+    -- Note written while the node was staged
+    if self.uiData.stagedTarget == nodeData and self.uiData.stagedNote ~= "" then
+        removal.note = self.uiData.stagedNote
+    end
+    if self.uiData.stagedTarget == nodeData then
+        self.uiData.stagedTarget = nil
+        self.uiData.stagedNote = ""
+    end
+
     local sector = self:addSector(preset, nodeData.sectorPath, nodeData.instanceCount)
     table.insert(sector.nodeDeletions, 1, removal)
     self:attachProxy(preset, removal, nodeData)
@@ -886,7 +1136,7 @@ function removal:addRemoval(nodeData, save)
 end
 
 function removal:getRemovalName(entry, sector)
-    local name = self.notes[getNoteKey(sector.path, entry.index)] or tostring(entry.type)
+    local name = (type(entry.note) == "string" and entry.note ~= "") and entry.note or tostring(entry.type)
     return string.format("%s | %s | %s / %s", name, utils.getSectorName(sector.path), tostring(entry.index), tostring(sector.expectedNodes))
 end
 
@@ -899,7 +1149,7 @@ function removal:isRemovalSearched(sector, entry)
         or utils.containsText(entry.type, text)
         or utils.containsText(entry.debugName, text)
         or utils.containsText(entry.resource, text)
-        or utils.containsText(self.notes[getNoteKey(sector.path, entry.index)], text)
+        or utils.containsText(entry.note, text)
 end
 
 function removal:deleteRemoval(preset, sector, entry)
@@ -912,7 +1162,7 @@ function removal:deleteRemoval(preset, sector, entry)
 
     self:cleanupPreset(preset)
 
-    config.saveFile("data/" .. self.currentFile, preset)
+    self:savePreset(self.currentFile)
 end
 
 function removal:new()
@@ -922,16 +1172,12 @@ function removal:new()
         local rht = GetMod("RedHotTools")
         self.runtimeData.rhtInstalled = hasInspector and rht ~= nil
 
-        config.tryCreateConfig("data/notes.json", self.notes)
-        local notes, err = config.tryLoadFile("data/notes.json")
-        if type(notes) == "table" then
-            self.notes = notes
-        else
-            -- Kept aside instead of being overwritten by the next note
-            os.rename("data/notes.json", "data/notes.invalid.json")
-            print(string.format("[RemovalEditor] Error: notes.json cannot be loaded (%s), it was renamed to notes.invalid.json.", tostring(err)))
-            self.notes = {}
+        local okVersion, version = pcall(function() return Game.GetSystemRequestsHandler():GetGameVersion() end)
+        if okVersion and type(version) == "string" and version ~= "" then
+            self.runtimeData.gameVersion = version
         end
+
+        self:migrateNotes()
 
         if not self.runtimeData.rhtInstalled then
             print("[RemovalEditor] Error: RedHotTools is not installed, Removal Editor needs it!")
