@@ -5,11 +5,138 @@ local style = require("modules/style")
 
 local target = nil
 
+--- Parts of a node that ArchiveXL can remove one by one, and the node types that have them.
+--- Since 2.5 the collisions of a sector are cooked into worldCookedCollisionNode: one nodeData entry per former collision node.
+local elementKinds = {
+    actor = {
+        list = "actorDeletions",
+        expected = "expectedActors",
+        label = "Collision Actors",
+        types = { worldCollisionNode = true, worldCookedCollisionNode = true }
+    },
+    instance = {
+        list = "instanceDeletions",
+        expected = "expectedInstances",
+        label = "Instances",
+        types = { worldInstancedMeshNode = true, worldInstancedDestructibleMeshNode = true, worldInstancedOccluderNode = true }
+    }
+}
+
+-- Elements shown in the UI for removals whose element count is unknown, so that an unticked element stays listed
+local knownElements = setmetatable({}, { __mode = "k" })
+
+--- Calls fn and returns its result, or nil if it fails (e.g. a property that does not exist in this game version)
+local function try(fn)
+    local ok, value = pcall(fn)
+    if ok then return value end
+end
+
+local function positiveInt(value)
+    value = tonumber(value)
+    if value and value > 0 then return math.floor(value) end
+end
+
+---@param nodeType string
+---@return table?
+local function getElementKind(nodeType)
+    for _, kind in pairs(elementKinds) do
+        if kind.types[nodeType] then return kind end
+    end
+end
+
+---@param entry removalEntry
+---@return table?
+local function getEntryElementKind(entry)
+    for _, kind in pairs(elementKinds) do
+        if entry[kind.list] then return kind end
+    end
+end
+
+--- Number of actors / instances of the targeted node (of its inner node for cooked nodes), nil if unknown
+---@param nodeData table RHT target data
+---@param kind table
+---@return number?
+local function getElementCount(nodeData, kind)
+    local node = nodeData.nodeDefinition
+    -- Index of the cooked inner node (2.5), only used when RHT gives a valid one
+    local inner = nodeData.innerIndex
+    local hasInner = type(inner) == "number" and type(nodeData.innerCount) == "number" and inner >= 0 and inner < nodeData.innerCount
+
+    if kind == elementKinds.actor then
+        -- worldCookedCollisionNode (2.5) does not expose its actors to scripts: RHT's actorCount (set when the
+        -- collision is hit in Inspect) is the actor count of the targeted inner node, checked against the sectors.
+        -- actorOffset only splits a node into physics proxies of 64 actors.
+        return (IsDefined(node) and positiveInt(try(function() return node.numActors end))) -- worldCollisionNode (2.31)
+            or positiveInt(nodeData.actorCount)
+    end
+
+    if IsDefined(node) then
+        local count = (hasInner and positiveInt(try(function() return node.transformRanges[inner + 1].numTransforms end))) -- worldInstancedMeshNode (2.5)
+            or positiveInt(try(function() return node.worldTransformsBuffer.numElements end)) -- worldInstancedMeshNode (2.31)
+            or positiveInt(try(function() return #node.instanceTransforms end)) -- worldInstancedDestructibleMeshNode
+            or positiveInt(try(function() return node.cookedInstanceTransforms.numElements end)) -- worldInstancedDestructibleMeshNode
+        if count then return count end
+    end
+
+    return positiveInt(nodeData.actorCount) -- RHT: instance count of the targeted mesh
+end
+
+--- Index of the actor / instance the target points at, nil if the whole node is targeted
+---@param nodeData table RHT target data
+---@param kind table
+---@param count number?
+---@return number?, string?
+local function getTargetElement(nodeData, kind, count)
+    -- Collisions not hit by a physics trace (e.g. from the Scanner) target the whole node
+    if kind == elementKinds.actor and not nodeData.collision then return nil end
+
+    local index = nodeData.actorIndex
+    if type(index) ~= "number" and nodeData.physicsActorOffset and nodeData.physicsActorIndex then
+        index = nodeData.physicsActorOffset + nodeData.physicsActorIndex
+    end
+    if type(index) ~= "number" or index < 0 then return nil end
+
+    if kind == elementKinds.instance and not positiveInt(nodeData.actorCount) then return nil end
+    if count and index >= count then
+        return nil, string.format("[RemovalEditor] Error: %s %d is out of range (%d), re-send the node from RHT!", kind.label, index, count)
+    end
+
+    return index
+end
+
+--- Value of nbNodesUnderProxyDiff this removal accounts for
+---@param entry removalEntry
+---@param nodeData table? RHT target data, only needed for a whole worldInstancedMeshNode
+---@return number
+local function getProxyDiff(entry, nodeData)
+    local kind = getEntryElementKind(entry)
+    local isInstancedMesh = entry.type == "worldInstancedMeshNode"
+
+    if kind then
+        local listed, expected = #entry[kind.list], entry[kind.expected]
+        if isInstancedMesh then return listed end -- Each instance counts as a node under the proxy
+        if expected and listed >= expected then return 1 end
+        return 0 -- The node itself stays
+    end
+
+    if isInstancedMesh then
+        local count = nodeData and getElementCount(nodeData, elementKinds.instance)
+        if not count then
+            print("[RemovalEditor] Warning: Instance count of this worldInstancedMeshNode is unknown, its proxy might not hide properly.")
+        end
+        return count or 1
+    end
+
+    return 1
+end
+
 ---@class removalEntry
 ---@field type string
 ---@field index number
 ---@field actorDeletions table?
 ---@field expectedActors number?
+---@field instanceDeletions table?
+---@field expectedInstances number?
 ---@field nbNodesUnderProxyDiff number?
 ---@field proxyHash string?
 ---@field proxyDiff number?
@@ -131,28 +258,71 @@ function removal:drawPresetUI()
     ImGui.EndChild()
 end
 
-function removal:drawActors(entry)
-    if ImGui.TreeNodeEx("Collision Actors" , ImGuiTreeNodeFlags.SpanFullWidth) then
-        ImGui.BeginChild("##actors", -1, math.min(8, #entry.actorDeletions) * ImGui.GetFrameHeightWithSpacing())
+--- Actor / instance list of a removal
+---@param preset table
+---@param entry removalEntry
+---@param kind table
+function removal:drawElements(preset, entry, kind)
+    local list = entry[kind.list]
+    local expected = entry[kind.expected]
 
-        for index = 0, entry.expectedActors - 1 do
-            local value = utils.has_value(entry.actorDeletions, index)
-            local newValue, changed = ImGui.Checkbox(tostring(index), value)
-            if changed then
-                if newValue then
-                    table.insert(entry.actorDeletions, index)
-                else
-                    utils.removeItem(entry.actorDeletions, index)
-                end
+    local label = string.format("%s (%d / %s)##elements", kind.label, #list, expected and tostring(expected) or "?")
+    if not ImGui.TreeNodeEx(label, ImGuiTreeNodeFlags.SpanFullWidth) then return end
 
-                config.saveFile("data/" .. self.currentFile, self.presets[self.currentFile])
-            end
-        end
-
-        ImGui.EndChild()
-
-        ImGui.TreePop()
+    if not expected then
+        ImGui.PushStyleColor(ImGuiCol.Text, 0xff5555ff)
+        ImGui.TextWrapped(string.format("No %s set: ArchiveXL removes the whole node. Re-send it from RHT's Inspect tab to fix it.", kind.expected))
+        ImGui.PopStyleColor()
     end
+
+    -- Without a known count, list the elements this removal ever had
+    local indices = {}
+    if expected then
+        for index = 0, expected - 1 do table.insert(indices, index) end
+    else
+        local known = knownElements[entry] or {}
+        for _, index in ipairs(list) do
+            if not utils.has_value(known, index) then table.insert(known, index) end
+        end
+        table.sort(known)
+        knownElements[entry] = known
+        indices = known
+    end
+
+    local changed = false
+    ImGui.BeginChild("##elements", -1, math.max(1, math.min(8, #indices)) * ImGui.GetFrameHeightWithSpacing())
+
+    for _, index in ipairs(indices) do
+        local value = utils.has_value(list, index)
+        local newValue, toggled = ImGui.Checkbox(tostring(index), value)
+        if toggled then
+            if newValue then
+                table.insert(list, index)
+            else
+                utils.removeItem(list, index)
+            end
+            changed = true
+        end
+    end
+
+    ImGui.EndChild()
+
+    if ImGui.Button("Remove whole node") then
+        local diff = entry.type == "worldInstancedMeshNode" and (expected or #list) or 1
+        entry[kind.list] = nil
+        entry[kind.expected] = nil
+        self:setProxyDiff(preset, entry, diff)
+        changed = true
+    elseif changed then
+        self:setProxyDiff(preset, entry, getProxyDiff(entry))
+    end
+    utils.tooltip("Remove the node with all its " .. string.lower(kind.label) .. ", instead of a selection of them.")
+
+    if changed then
+        config.saveFile("data/" .. self.currentFile, preset)
+    end
+
+    ImGui.TreePop()
 end
 
 function removal:drawDirectTarget()
@@ -182,8 +352,12 @@ function removal:drawDirectTarget()
             style.drawProp("Position", string.format("X: %.2f Y: %.2f Z: %.2f", position.x, position.y, position.z))
         end
 
-        if target.physicsActorOffset and target.physicsActorIndex then
-            style.drawProp("Physics Actor", target.physicsActorOffset + target.physicsActorIndex .. "/" .. target.nodeDefinition.numActors)
+        local kind = getElementKind(target.nodeType)
+        if kind then
+            local count = getElementCount(target, kind)
+            local element = getTargetElement(target, kind, count)
+            style.drawProp(kind == elementKinds.actor and "Collision Actor" or "Instance",
+                (element and tostring(element) or "All") .. " / " .. (count and tostring(count) or "?"))
         end
 
         ImGui.PushStyleColor(ImGuiCol.Text, 0xff9f9f9f)
@@ -260,14 +434,16 @@ function removal:drawRemovals(preset)
     local elements = math.max(8, math.min(20, utils.getTotalRemovals(preset)))
     ImGui.BeginChild("##removals", -1, elements * ImGui.GetFrameHeightWithSpacing())
 
-    for sectorKey, sector in pairs(preset.streaming.sectors) do
-        for entryKey, entry in pairs(sector.nodeDeletions) do
+    local deleted = nil
+
+    for _, sector in pairs(preset.streaming.sectors) do
+        for _, entry in pairs(sector.nodeDeletions) do
             if self:isRemovalSearched(sector, entry) then
                 if ImGui.TreeNodeEx("##" .. tostring(entry.index) .. tostring(sector.path), ImGuiTreeNodeFlags.SpanFullWidth, self:getRemovalName(entry, sector)) then
                     ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, 5, 2)
 
-                    if not self:drawRemoval(sector, entry) then
-                        self:deleteRemoval(preset, sector, entry, entryKey, sectorKey)
+                    if not self:drawRemoval(preset, sector, entry) then
+                        deleted = { sector = sector, entry = entry }
                     end
 
                     ImGui.PopStyleVar(1)
@@ -278,9 +454,14 @@ function removal:drawRemovals(preset)
     end
 
     ImGui.EndChild()
+
+    -- Deleted once the lists are no longer iterated
+    if deleted then
+        self:deleteRemoval(preset, deleted.sector, deleted.entry)
+    end
 end
 
-function removal:drawRemoval(sector, entry)
+function removal:drawRemoval(preset, sector, entry)
     style.drawProp("Type", entry.type)
     style.drawProp("Sector Path", sector.path)
     style.drawProp("Node Index", tostring(entry.index .. "/" .. sector.expectedNodes))
@@ -297,8 +478,9 @@ function removal:drawRemoval(sector, entry)
         style.drawProp("NodeRef", entry.nodeRef)
     end
 
-    if entry.actorDeletions then
-        self:drawActors(entry)
+    local kind = getEntryElementKind(entry)
+    if kind then
+        self:drawElements(preset, entry, kind)
     end
 
     ImGui.PushStyleColor(ImGuiCol.Text, 0xff9f9f9f)
@@ -352,55 +534,42 @@ function removal:drawUI()
     ImGui.End()
 end
 
---- Get the removal table to be used in the .xl file for a specific node
----@param nodeType string
----@param index number
----@param object worldNode
----@return removalEntry, boolean
-local function getNodeRemoval(nodeType, index)
-    local result = {}
-    local proxyID = target.nodeProxyID
+--- Get the removal table to be used in the .xl file for a specific node. Changes nothing in the preset.
+---@param nodeData table RHT target data
+---@return removalEntry?, string?
+local function getNodeRemoval(nodeData)
+    local result = {
+        type = nodeData.nodeType,
+        index = nodeData.instanceIndex
+    }
 
-    if proxyID and proxyID ~= 0 then
-        local proxy = removal:createProxyMutation(proxyID)
+    local kind = getElementKind(nodeData.nodeType)
+    if not kind then return result end
 
-        if proxy then
-            local diff = 1
+    local count = getElementCount(nodeData, kind)
+    local element, err = getTargetElement(nodeData, kind, count)
+    if err then return nil, err end
 
-            if target.nodeDefinition:IsA("worldInstancedMeshNode") then
-                diff = target.nodeDefinition.worldTransformsBuffer.numElements
-            end
+    if element and not count then
+        -- ArchiveXL removes the whole node when a list comes without its expected count (tested in 2.5)
+        return nil, string.format("[RemovalEditor] Error: %s count of this node is unknown, target it in RHT's Inspect tab and re-send it!", kind.label)
+    end
 
-            proxy.nbNodesUnderProxyDiff = proxy.nbNodesUnderProxyDiff - diff
-            result.proxyHash = proxy.nodeRefHash
-            result.proxyDiff = diff
+    if element and not (kind == elementKinds.instance and count == 1) then
+        -- A single actor / instance
+        result[kind.list] = { element }
+        result[kind.expected] = count
+    elseif kind == elementKinds.actor and count then
+        -- Whole collision node, listing its actors so that they can be un-removed one by one
+        local actors = {}
+        for i = 0, count - 1 do
+            table.insert(actors, i)
         end
+        result[kind.list] = actors
+        result[kind.expected] = count
     end
 
-    result.type = nodeType
-    result.index = index
-
-    if nodeType ~= "worldCollisionNode" then
-        return result, true
-    end
-
-    if not IsDefined(target.nodeDefinition) then
-        return result, false
-    end
-
-    local actorDeletions = {}
-
-    if not target.collision then
-        for i = 0, target.nodeDefinition.numActors - 1 do
-            table.insert(actorDeletions, i)
-        end
-    else
-        actorDeletions = { target.physicsActorOffset + target.physicsActorIndex }
-    end
-
-    result.expectedActors = target.nodeDefinition.numActors
-    result.actorDeletions = actorDeletions
-    return result, true
+    return result
 end
 
 local function isWorldNode(node)
@@ -483,42 +652,146 @@ function removal:createProxyMutation(hash)
     return proxy
 end
 
+---@param preset table
+---@param hashString string
+---@return proxyMutation?
+local function findProxyMutation(preset, hashString)
+    for _, sector in pairs(preset.streaming.sectors) do
+        for _, node in pairs(sector.nodeMutations) do
+            if node.nodeRefHash == hashString then
+                return node
+            end
+        end
+    end
+end
+
+--- Sets the share of the proxy's nbNodesUnderProxyDiff this removal accounts for
+---@param preset table
+---@param entry removalEntry
+---@param diff number
+function removal:setProxyDiff(preset, entry, diff)
+    if not entry.proxyHash then return end
+
+    local delta = diff - (entry.proxyDiff or 0)
+    if delta == 0 then return end
+
+    local proxy = findProxyMutation(preset, entry.proxyHash)
+    if proxy then
+        proxy.nbNodesUnderProxyDiff = proxy.nbNodesUnderProxyDiff - delta
+    elseif diff > 0 then
+        print("[RemovalEditor] Error: Proxy mutation of this removal is missing, re-send the node from RHT!")
+        return
+    end
+
+    entry.proxyDiff = diff
+end
+
+--- Links a new removal to the proxy mesh it is part of, once the removal is in the preset
+---@param preset table
+---@param entry removalEntry
+---@param nodeData table RHT target data
+function removal:attachProxy(preset, entry, nodeData)
+    local proxyID = nodeData.nodeProxyID
+    if not proxyID or proxyID == 0 then return end
+
+    local proxy = self:createProxyMutation(proxyID)
+    if not proxy then return end
+
+    entry.proxyHash = proxy.nodeRefHash
+    entry.proxyDiff = 0
+    self:setProxyDiff(preset, entry, getProxyDiff(entry, nodeData))
+end
+
+--- Removes the proxy mutations no removal uses anymore, then the empty sectors
+---@param preset table
+function removal:cleanupPreset(preset)
+    local used = {}
+    for _, sector in pairs(preset.streaming.sectors) do
+        for _, entry in pairs(sector.nodeDeletions) do
+            if entry.proxyHash then used[entry.proxyHash] = true end
+        end
+    end
+
+    for sectorKey = #preset.streaming.sectors, 1, -1 do
+        local sector = preset.streaming.sectors[sectorKey]
+
+        for mutationKey = #sector.nodeMutations, 1, -1 do
+            local mutation = sector.nodeMutations[mutationKey]
+            if mutation.nodeRefHash and not used[mutation.nodeRefHash]
+                and mutation.nbNodesUnderProxyDiff and mutation.nbNodesUnderProxyDiff >= 0 then
+                table.remove(sector.nodeMutations, mutationKey)
+            end
+        end
+
+        if #sector.nodeDeletions == 0 and #sector.nodeMutations == 0 then
+            table.remove(preset.streaming.sectors, sectorKey)
+        end
+    end
+end
+
+--- Adds an actor / instance to an existing removal of the same node
+---@param preset table
+---@param entry removalEntry
+---@param nodeData table RHT target data
+---@return boolean changed
+function removal:addElementToRemoval(preset, entry, nodeData)
+    local kind = getEntryElementKind(entry)
+    if not kind then return false end -- The whole node is already removed
+
+    local count = entry[kind.expected] or getElementCount(nodeData, kind)
+    local element, err = getTargetElement(nodeData, kind, count)
+    if err then print(err) end
+    if not element then return false end
+
+    local changed = false
+    if not entry[kind.expected] and count then
+        entry[kind.expected] = count -- Fills in the count missing from an older removal
+        changed = true
+    end
+    if utils.has_value(entry[kind.list], element) then return changed end
+
+    table.insert(entry[kind.list], element)
+    self:setProxyDiff(preset, entry, getProxyDiff(entry))
+    return true
+end
+
 function removal:addRemoval(nodeData)
     local preset = self.presets[self.currentFile]
     if not preset then return end
 
-    local sector = self:addSector(preset, nodeData.sectorPath, nodeData.instanceCount)
-
-    local hasRemoval, data = hasSectorRemoval(sector, nodeData.instanceIndex)
+    local existingSector = utils.findSectorByPath(preset.streaming.sectors, nodeData.sectorPath)
+    local hasRemoval, data = hasSectorRemoval(existingSector, nodeData.instanceIndex)
 
     if hasRemoval then
-        if data and data.actorDeletions then
-            local actor = target.physicsActorOffset + target.physicsActorIndex
-
-            if not utils.has_value(data.actorDeletions, actor) then
-                table.insert(data.actorDeletions, actor)
-            end
-
-            config.saveFile("data/" .. self.currentFile, self.presets[self.currentFile])
+        if data and self:addElementToRemoval(preset, data, nodeData) then
+            config.saveFile("data/" .. self.currentFile, preset)
         end
         return
     end
 
-    local removal, success = getNodeRemoval(nodeData.nodeType, nodeData.instanceIndex)
-    if not success then
-        print("[RemovalEditor] Error: Node to be removed was streamed out, re-send it from RHT!")
+    -- Everything is validated before the preset is touched
+    local removal, err = getNodeRemoval(nodeData)
+    if not removal then
+        print(err)
         return
     end
 
     local position = nodeData.nodePosition or nodeData.entityPosition
     local orientation = nodeData.nodeOrientation or nodeData.entityOrientation
-    removal.position = { x = position.x, y = position.y, z = position.z }
-    removal.orientation = { i = orientation.i, j = orientation.j, k = orientation.k, r = orientation.r }
+    if position then
+        removal.position = { x = position.x, y = position.y, z = position.z }
+    end
+    if orientation then
+        removal.orientation = { i = orientation.i, j = orientation.j, k = orientation.k, r = orientation.r }
+    end
     removal.nodeRef = nodeData.nodeRef or ""
     removal.resource = nodeData.meshPath or nodeData.templatePath or nodeData.materialPath or nodeData.effectPath or nodeData.recordID or ""
     removal.debugName = nodeData.debugName or ""
 
+    local sector = self:addSector(preset, nodeData.sectorPath, nodeData.instanceCount)
     table.insert(sector.nodeDeletions, 1, removal)
+    self:attachProxy(preset, removal, nodeData)
+
     config.saveFile("data/" .. self.currentFile, preset)
 
     if self.uiData.newNote ~= "" then
@@ -555,33 +828,15 @@ function removal:isRemovalSearched(sector, entry)
     return false
 end
 
-function removal:updateProxyMutation(preset, entry)
-    if not entry.proxyHash then return end
+function removal:deleteRemoval(preset, sector, entry)
+    self:setProxyDiff(preset, entry, 0)
 
-    for sectorKey, sector in pairs(preset.streaming.sectors) do
-        for proxyIndex, node in pairs(sector.nodeMutations) do
-            if node.nodeRefHash == entry.proxyHash then
-                node.nbNodesUnderProxyDiff = node.nbNodesUnderProxyDiff + entry.proxyDiff
-
-                if node.nbNodesUnderProxyDiff >= 0 then
-                    table.remove(sector.nodeMutations, proxyIndex)
-                end
-
-                if #sector.nodeMutations == 0 and #sector.nodeDeletions == 0 then
-                    table.remove(preset.streaming.sectors, sectorKey)
-                end
-            end
-        end
-    end
-end
-
-function removal:deleteRemoval(preset, sector, entry, entryKey, sectorKey)
-    table.remove(sector.nodeDeletions, entryKey)
-    if #sector.nodeDeletions == 0 and #sector.nodeMutations then
-        table.remove(preset.streaming.sectors, sectorKey)
+    local entryKey = utils.getIndex(sector.nodeDeletions, entry)
+    if entryKey then
+        table.remove(sector.nodeDeletions, entryKey)
     end
 
-    self:updateProxyMutation(preset, entry)
+    self:cleanupPreset(preset)
 
     config.saveFile("data/" .. self.currentFile, preset)
 end
