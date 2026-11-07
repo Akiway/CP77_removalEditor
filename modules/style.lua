@@ -28,7 +28,7 @@ function style.drawProp(name, value)
     ImGui.TextWrapped(tostring(value))
 
     if ImGui.IsItemClicked(ImGuiMouseButton.Middle) then
-        ImGui.SetClipboardText(value)
+        ImGui.SetClipboardText(tostring(value))
     end
 end
 

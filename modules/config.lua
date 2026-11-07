@@ -14,18 +14,43 @@ function config.tryCreateConfig(path, data)
     end
 end
 
-function config.loadFile(path)
+--- Reads a JSON file without ever raising an error
+---@param path string
+---@return any? data
+---@return string? err Reason the file could not be read
+function config.tryLoadFile(path)
     local file = io.open(path, "r")
-    local config = json.decode(file:read("*a"))
+    if not file then return nil, "cannot be opened" end
+
+    local content = file:read("*a")
     file:close()
-    return config
+
+    local ok, data = pcall(json.decode, content)
+    if not ok then return nil, "not valid JSON (" .. tostring(data) .. ")" end
+    if data == nil then return nil, "empty" end
+
+    return data
+end
+
+function config.loadFile(path)
+    local data, err = config.tryLoadFile(path)
+    if err then
+        error(string.format("[RemovalEditor] %s: %s", path, err))
+    end
+    return data
 end
 
 function config.saveFile(path, data)
     local file = io.open(path, "w")
+    if not file then
+        print(string.format("[RemovalEditor] Error: %s cannot be written!", path))
+        return false
+    end
+
     local jconfig = json.encode(data)
     file:write(jconfig)
     file:close()
+    return true
 end
 
 function config.loadPaths(path)

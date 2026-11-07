@@ -161,11 +161,12 @@ local removal = {
 
     uiData = {
         newPresetName = "",
-        newNote = "",
-        switchToEdit = false
+        switchToEdit = false,
+        pendingDelete = nil
     },
 
     presets = {},
+    invalidPresets = {}, -- File name -> reason it cannot be loaded
     notes = {},
     currentFile = "",
     directAdd = true,
@@ -182,23 +183,61 @@ function removal:getEditFlag()
     return ImGuiTabItemFlags.None
 end
 
-function removal:drawPresetUI()
-    for _, file in pairs(dir("data")) do
-        if file.name:match("^.+(%..+)$") == ".xl" then
-            if not self.presets[file.name] then
-                self.presets[file.name] = config.loadFile("data/" .. file.name)
+--- Loads a preset file, nil and the reason if it cannot be used
+---@param name string
+---@return table?, string?
+local function loadPreset(name)
+    local preset, err = config.tryLoadFile("data/" .. name)
+    if not preset then return nil, err end
 
-                for  _, sector in pairs(self.presets[file.name].streaming.sectors) do
-                    if not sector.nodeDeletions then
-                        sector.nodeDeletions = {}
-                    end
-                    if not sector.nodeMutations then
-                        sector.nodeMutations = {}
-                    end
+    if type(preset) ~= "table" or type(preset.streaming) ~= "table" or type(preset.streaming.sectors) ~= "table" then
+        return nil, "no streaming.sectors list"
+    end
+
+    for _, sector in pairs(preset.streaming.sectors) do
+        if type(sector) ~= "table" or type(sector.path) ~= "string" then
+            return nil, "a sector has no path"
+        end
+        sector.nodeDeletions = sector.nodeDeletions or {}
+        sector.nodeMutations = sector.nodeMutations or {}
+    end
+
+    return preset
+end
+
+--- Keeps the loaded presets in sync with the .xl files of the data folder
+function removal:refreshPresets()
+    local files = {}
+    for _, file in pairs(dir("data") or {}) do
+        if file.name:match("^.+(%..+)$") == ".xl" then
+            files[file.name] = true
+
+            if not self.presets[file.name] and not self.invalidPresets[file.name] then
+                local preset, err = loadPreset(file.name)
+                if preset then
+                    self.presets[file.name] = preset
+                else
+                    self.invalidPresets[file.name] = err
+                    print(string.format("[RemovalEditor] Error: Preset \"%s\" cannot be loaded: %s", file.name, err))
                 end
             end
         end
     end
+
+    -- Files removed outside of Removal Editor
+    for name, _ in pairs(self.presets) do
+        if not files[name] then
+            self.presets[name] = nil
+            if self.currentFile == name then self.currentFile = "" end
+        end
+    end
+    for name, _ in pairs(self.invalidPresets) do
+        if not files[name] then self.invalidPresets[name] = nil end
+    end
+end
+
+function removal:drawPresetUI()
+    self:refreshPresets()
 
     self.uiData.newPresetName =  ImGui.InputTextWithHint("##newName", "Name...", self.uiData.newPresetName, 100)
     self.uiData.newPresetName = utils.sanitizeFileName(self.uiData.newPresetName) -- Sanitize
@@ -216,11 +255,11 @@ function removal:drawPresetUI()
     style.popGreyedOut(not validName)
     style.spacedSeparator()
 
-    local elements = math.max(5, math.min(20, utils.countTableSize(self.presets))) -- Guh
-    ImGui.BeginChild("##presets", -1, elements * ImGui.GetFrameHeightWithSpacing()) -- What
+    local elements = math.max(5, math.min(20, utils.countTableSize(self.presets) + utils.countTableSize(self.invalidPresets)))
+    ImGui.BeginChild("##presets", -1, elements * ImGui.GetFrameHeightWithSpacing())
 
     for name, preset in pairs(self.presets) do
-        if ImGui.TreeNodeEx(name:match("(.+)%..+$"), ImGuiTreeNodeFlags.SpanFullWidth) then
+        if ImGui.TreeNodeEx(utils.removeExtension(name) .. "##" .. name, ImGuiTreeNodeFlags.SpanFullWidth) then
             style.drawProp("Sectors", #preset.streaming.sectors)
             style.drawProp("Removals", utils.getTotalRemovals(preset))
             style.drawProp("Mutations", utils.getTotalMutations(preset))
@@ -232,15 +271,28 @@ function removal:drawPresetUI()
                 self.uiData.switchToEdit = true
             end
             ImGui.SameLine()
-            if ImGui.Button("Delete") then
-                os.remove("data/" .. name)
-                self.presets[name] = nil
-                if self.currentFile == name then
-                    self.currentFile = ""
+
+            if self.uiData.pendingDelete == name then
+                if ImGui.Button("Confirm delete") then
+                    os.remove("data/" .. name)
+                    self.presets[name] = nil
+                    self.uiData.pendingDelete = nil
+                    if self.currentFile == name then
+                        self.currentFile = ""
+                    end
                 end
+                ImGui.SameLine()
+                if ImGui.Button("Cancel") then
+                    self.uiData.pendingDelete = nil
+                end
+            elseif ImGui.Button("Delete") then
+                self.uiData.pendingDelete = name
             end
             ImGui.SameLine()
-            if ImGui.Button("Install & Reload") then
+
+            local inGame = IsDefined(GetPlayer())
+            style.pushGreyedOut(not inGame)
+            if ImGui.Button("Install & Reload") and inGame then
                 RedHotTools.HotInstall(string.format("bin\\x64\\plugins\\cyber_engine_tweaks\\mods\\removalEditor\\data\\%s", name))
                 self.reloadTransform.position = GetPlayer():GetWorldPosition()
                 self.reloadTransform.rotation = GetPlayer():GetWorldOrientation():ToEulerAngles()
@@ -248,10 +300,22 @@ function removal:drawPresetUI()
 
                 Game.GetSystemRequestsHandler():LoadLastCheckpoint(true)
             end
-            utils.tooltip("Make a Quick-Save to speed up the reload process.")
+            style.popGreyedOut(not inGame)
+            utils.tooltip("Installs the preset and reloads the last save. Make a Quick-Save first, to keep your progress and speed up the reload.")
             ImGui.PopStyleVar(1)
 
             ImGui.TreePop()
+        end
+    end
+
+    -- Files that could not be read stay listed, instead of breaking the whole window
+    for name, err in pairs(self.invalidPresets) do
+        ImGui.PushStyleColor(ImGuiCol.Text, 0xff5555ff)
+        ImGui.TextWrapped(string.format("%s: cannot be loaded (%s)", name, err))
+        ImGui.PopStyleColor()
+        ImGui.SameLine()
+        if ImGui.Button("Retry##" .. name) then
+            self.invalidPresets[name] = nil
         end
     end
 
@@ -325,6 +389,28 @@ function removal:drawElements(preset, entry, kind)
     ImGui.TreePop()
 end
 
+--- Key of a node in notes.json, e.g. "exterior_-7_6_0_2_540"
+---@param sectorPath string
+---@param index number
+---@return string
+local function getNoteKey(sectorPath, index)
+    return utils.getSectorName(sectorPath) .. "_" .. tostring(index)
+end
+
+function removal:drawNoteInput(id, sectorPath, index)
+    ImGui.PushStyleColor(ImGuiCol.Text, 0xff9f9f9f)
+    ImGui.TextWrapped("Note:")
+    ImGui.PopStyleColor()
+    ImGui.SameLine()
+
+    local key = getNoteKey(sectorPath, index)
+    local text, changed = ImGui.InputTextWithHint(id, "Note...", self.notes[key] or "", 100)
+    if changed then
+        self.notes[key] = #text > 0 and text or nil
+        config.saveFile("data/notes.json", self.notes)
+    end
+end
+
 function removal:drawDirectTarget()
     style.pushGreyedOut(not target)
     ImGui.Spacing()
@@ -360,21 +446,7 @@ function removal:drawDirectTarget()
                 (element and tostring(element) or "All") .. " / " .. (count and tostring(count) or "?"))
         end
 
-        ImGui.PushStyleColor(ImGuiCol.Text, 0xff9f9f9f)
-        ImGui.TextWrapped("Note:")
-        ImGui.PopStyleColor()
-        ImGui.SameLine()
-
-        local sectorName = target.sectorPath:match("(.+)%..+$"):match("[^\\]*.$")
-        local note = self.notes[tostring(sectorName .. "_" .. target.instanceIndex)] or ""
-        local text, changed = ImGui.InputTextWithHint("##noteAdd", "Note...", note, 100)
-        if changed and #text > 0 then
-            self.notes[tostring(sectorName .. "_" .. target.instanceIndex)] = text
-            config.saveFile("data/notes.json", self.notes)
-        elseif changed then
-            self.notes[tostring(sectorName .. "_" .. target.instanceIndex)] = nil
-            config.saveFile("data/notes.json", self.notes)
-        end
+        self:drawNoteInput("##noteAdd", target.sectorPath, target.instanceIndex)
     end
 
     ImGui.Spacing()
@@ -402,13 +474,24 @@ function removal:drawEditUI()
     self.directAdd = ImGui.Checkbox("Add nodes directly from RedHotTools window", self.directAdd)
 
     if ImGui.Button("Add all scanned & filtered nodes") then
-        local nodes = GetMod("RedHotTools").GetWorldScannerFilteredResults()
+        local nodes = GetMod("RedHotTools").GetWorldScannerFilteredResults() or {}
+        local added, skipped = 0, 0
 
         for _, node in pairs(nodes) do
-            target = node
-            self:addRemoval(node)
+            if self:addRemoval(node, false) then
+                target = node
+                added = added + 1
+            else
+                skipped = skipped + 1
+            end
         end
+
+        if added > 0 then
+            config.saveFile("data/" .. self.currentFile, self.presets[self.currentFile])
+        end
+        print(string.format("[RemovalEditor] Added %d scanned node(s), skipped %d (not world nodes, already in the preset or invalid).", added, skipped))
     end
+    utils.tooltip("Adds every result of RHT's Scan tab matching its current filter.")
 
     if not self.directAdd then
         style.spacedSeparator()
@@ -417,7 +500,7 @@ function removal:drawEditUI()
     style.spacedSeparator()
 
     ImGui.PushItemWidth(400)
-    self.searchText = ImGui.InputTextWithHint("##searchForNode", "Search for node (Type, Sector, Index, Note)", self.searchText, 100)
+    self.searchText = ImGui.InputTextWithHint("##searchForNode", "Search (Type, Sector, Index, Name, Resource, Note)", self.searchText, 100)
     if self.searchText ~= "" then
         ImGui.SameLine()
         if ImGui.Button("X") then
@@ -464,7 +547,7 @@ end
 function removal:drawRemoval(preset, sector, entry)
     style.drawProp("Type", entry.type)
     style.drawProp("Sector Path", sector.path)
-    style.drawProp("Node Index", tostring(entry.index .. "/" .. sector.expectedNodes))
+    style.drawProp("Node Index", tostring(entry.index) .. "/" .. tostring(sector.expectedNodes))
     if entry.position then
         style.drawProp("Position", string.format("X: %.2f Y: %.2f Z: %.2f", entry.position.x, entry.position.y, entry.position.z))
     end
@@ -483,21 +566,7 @@ function removal:drawRemoval(preset, sector, entry)
         self:drawElements(preset, entry, kind)
     end
 
-    ImGui.PushStyleColor(ImGuiCol.Text, 0xff9f9f9f)
-    ImGui.TextWrapped("Note:")
-    ImGui.PopStyleColor()
-    ImGui.SameLine()
-
-    local sectorName = sector.path:match("(.+)%..+$"):match("[^\\]*.$")
-    local note = self.notes[tostring(sectorName .. "_" .. entry.index)] or ""
-    local text, changed = ImGui.InputTextWithHint("##noteRemoval", "Note...", note, 100)
-    if changed and #text > 0 then
-        self.notes[tostring(sectorName .. "_" .. entry.index)] = text
-        config.saveFile("data/notes.json", self.notes)
-    elseif changed then
-        self.notes[tostring(sectorName .. "_" .. entry.index)] = nil
-        config.saveFile("data/notes.json", self.notes)
-    end
+    self:drawNoteInput("##noteRemoval", sector.path, entry.index)
 
     if ImGui.Button("Remove") then
         return false
@@ -508,30 +577,31 @@ end
 
 function removal:drawUI()
     ImGui.SetNextWindowSize(style.width + style.paddingX * 2, 0)
+    -- Popped after End: the window and its children use it, the windows of other mods do not
     ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, style.paddingX, style.paddingY)
 
     if ImGui.Begin("Removal Editor", ImGuiWindowFlags.NoResize + ImGuiWindowFlags.NoScrollbar) then
         if not self.runtimeData.rhtInstalled then
             ImGui.Text("RedHotTools is not installed!")
-            ImGui.End()
-            return
-        end
+        elseif ImGui.BeginTabBar("Tabbar", ImGuiTabBarFlags.NoTooltip) then
+            if ImGui.BeginTabItem(" Presets ") then
+                ImGui.Spacing()
+                self:drawPresetUI()
+                ImGui.EndTabItem()
+            end
 
-        ImGui.BeginTabBar("Tabbar", ImGuiTabItemFlags.NoTooltip)
+            if ImGui.BeginTabItem(" Edit ", self:getEditFlag()) then
+                ImGui.Spacing()
+                self:drawEditUI()
+                ImGui.EndTabItem()
+            end
 
-        if ImGui.BeginTabItem(" Presets ") then
-            ImGui.Spacing()
-            self:drawPresetUI()
-            ImGui.EndTabItem()
-        end
-
-        if ImGui.BeginTabItem(" Edit ", self:getEditFlag()) then
-            ImGui.Spacing()
-            self:drawEditUI()
-            ImGui.EndTabItem()
+            ImGui.EndTabBar()
         end
     end
     ImGui.End()
+
+    ImGui.PopStyleVar(1)
 end
 
 --- Get the removal table to be used in the .xl file for a specific node. Changes nothing in the preset.
@@ -755,25 +825,43 @@ function removal:addElementToRemoval(preset, entry, nodeData)
     return true
 end
 
-function removal:addRemoval(nodeData)
+--- Adds a node (or one of its actors / instances) to the opened preset
+---@param nodeData table RHT target data
+---@param save boolean? Saves the preset file (default true)
+---@return boolean changed
+function removal:addRemoval(nodeData, save)
     local preset = self.presets[self.currentFile]
-    if not preset then return end
+    if not preset then
+        print("[RemovalEditor] Error: No preset is opened, open one from the Presets tab first!")
+        return false
+    end
+    if not isWorldNode(nodeData) then
+        print("[RemovalEditor] Error: The target is not a world node, it cannot be removed!")
+        return false
+    end
+
+    local function saveIfWanted()
+        if save ~= false then
+            config.saveFile("data/" .. self.currentFile, preset)
+        end
+    end
 
     local existingSector = utils.findSectorByPath(preset.streaming.sectors, nodeData.sectorPath)
     local hasRemoval, data = hasSectorRemoval(existingSector, nodeData.instanceIndex)
 
     if hasRemoval then
         if data and self:addElementToRemoval(preset, data, nodeData) then
-            config.saveFile("data/" .. self.currentFile, preset)
+            saveIfWanted()
+            return true
         end
-        return
+        return false
     end
 
     -- Everything is validated before the preset is touched
     local removal, err = getNodeRemoval(nodeData)
     if not removal then
         print(err)
-        return
+        return false
     end
 
     local position = nodeData.nodePosition or nodeData.entityPosition
@@ -785,47 +873,33 @@ function removal:addRemoval(nodeData)
         removal.orientation = { i = orientation.i, j = orientation.j, k = orientation.k, r = orientation.r }
     end
     removal.nodeRef = nodeData.nodeRef or ""
-    removal.resource = nodeData.meshPath or nodeData.templatePath or nodeData.materialPath or nodeData.effectPath or nodeData.recordID or ""
+    removal.resource = nodeData.meshPath or nodeData.templatePath or nodeData.materialPath or nodeData.effectPath
+        or nodeData.particlePath or nodeData.foliagePath or nodeData.workspotPath or nodeData.recordID or ""
     removal.debugName = nodeData.debugName or ""
 
     local sector = self:addSector(preset, nodeData.sectorPath, nodeData.instanceCount)
     table.insert(sector.nodeDeletions, 1, removal)
     self:attachProxy(preset, removal, nodeData)
 
-    config.saveFile("data/" .. self.currentFile, preset)
-
-    if self.uiData.newNote ~= "" then
-        local sectorName = nodeData.sectorData.sectorPath:match("(.+)%..+$"):match("[^\\]*.$")
-        self.notes[tostring(sectorName .. "_" .. nodeData.sectorData.instanceIndex)] = self.uiData.newNote
-        config.saveFile("data/notes.json", self.notes)
-        self.uiData.newNote = ""
-    end
+    saveIfWanted()
+    return true
 end
 
 function removal:getRemovalName(entry, sector)
-    local sectorName = sector.path:match("(.+)%..+$"):match("[^\\]*.$")
-    local name = self.notes[tostring(sectorName .. "_" .. entry.index)]
-    if name then
-        name = name
-    else
-        name = entry.type
-    end
-    return name .. " | " .. sectorName .. " | " .. entry.index .. " / " .. sector.expectedNodes
+    local name = self.notes[getNoteKey(sector.path, entry.index)] or tostring(entry.type)
+    return string.format("%s | %s | %s / %s", name, utils.getSectorName(sector.path), tostring(entry.index), tostring(sector.expectedNodes))
 end
 
 function removal:isRemovalSearched(sector, entry)
     if self.searchText == "" then return true end
 
-    local text = string.lower(self.searchText)
-    if string.match(string.lower(sector.path), text) then return true end
-    if string.match(string.lower(tostring(entry.index)), text) then return true end
-    if string.match(string.lower(tostring(entry.type)), text) then return true end
-
-    local sectorName = sector.path:match("(.+)%..+$"):match("[^\\]*.$")
-    local note = self.notes[tostring(sectorName .. "_" .. entry.index)]
-    if note ~= nil and string.match(string.lower(note), text) ~= nil then return true end
-
-    return false
+    local text = self.searchText
+    return utils.containsText(sector.path, text)
+        or utils.containsText(entry.index, text)
+        or utils.containsText(entry.type, text)
+        or utils.containsText(entry.debugName, text)
+        or utils.containsText(entry.resource, text)
+        or utils.containsText(self.notes[getNoteKey(sector.path, entry.index)], text)
 end
 
 function removal:deleteRemoval(preset, sector, entry)
@@ -843,10 +917,26 @@ end
 
 function removal:new()
     registerForEvent("onInit", function()
-        self.runtimeData.rhtInstalled = Game.GetWorldInspector() ~= nil
+        -- Game.GetWorldInspector raises an error when the RHT plugin is not loaded
+        local hasInspector = pcall(function() return Game.GetWorldInspector() end) and IsDefined(Game.GetWorldInspector())
+        local rht = GetMod("RedHotTools")
+        self.runtimeData.rhtInstalled = hasInspector and rht ~= nil
 
         config.tryCreateConfig("data/notes.json", self.notes)
-        self.notes = config.loadFile("data/notes.json")
+        local notes, err = config.tryLoadFile("data/notes.json")
+        if type(notes) == "table" then
+            self.notes = notes
+        else
+            -- Kept aside instead of being overwritten by the next note
+            os.rename("data/notes.json", "data/notes.invalid.json")
+            print(string.format("[RemovalEditor] Error: notes.json cannot be loaded (%s), it was renamed to notes.invalid.json.", tostring(err)))
+            self.notes = {}
+        end
+
+        if not self.runtimeData.rhtInstalled then
+            print("[RemovalEditor] Error: RedHotTools is not installed, Removal Editor needs it!")
+            return
+        end
 
         GameUI.OnSessionStart(function()
             if self.reload then
@@ -855,7 +945,7 @@ function removal:new()
             end
         end)
 
-        GetMod("RedHotTools").RegisterExtension({
+        rht.RegisterExtension({
             getTargetActions = function(node)
                 if isWorldNode(node) then
                     return {
@@ -888,10 +978,14 @@ function removal:new()
 end
 
 registerHotkey("addNode", "Add [Inspect] node", function()
-    local node = GetMod("RedHotTools").GetWorldInspectorTarget()
+    local rht = GetMod("RedHotTools")
+    if not rht or not removal.runtimeData.rhtInstalled then return end
+
+    local node = rht.GetWorldInspectorTarget()
     if not node then return end
-    target = node
-    removal:addRemoval(target)
+    if removal:addRemoval(node) then
+        target = node
+    end
 end)
 
 return removal:new()

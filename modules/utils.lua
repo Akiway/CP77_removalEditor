@@ -107,6 +107,30 @@ function utils.sanitizeFileName(name)
     return name
 end
 
+--- File name without its last extension ("a.b.xl" -> "a.b")
+---@param name string
+---@return string
+function utils.removeExtension(name)
+    return name:match("^(.+)%.[^.]*$") or name
+end
+
+--- Sector file name without folder and extension, used as the key of notes (e.g. "exterior_-7_6_0_2")
+---@param path string
+---@return string
+function utils.getSectorName(path)
+    local name = tostring(path):match("([^\\/]+)$") or tostring(path)
+    return utils.removeExtension(name)
+end
+
+--- Case-insensitive plain text search (no Lua pattern: "-", "(" or "%" are searched as they are)
+---@param text any
+---@param search string
+---@return boolean
+function utils.containsText(text, search)
+    if text == nil then return false end
+    return string.find(string.lower(tostring(text)), string.lower(search), 1, true) ~= nil
+end
+
 function utils.round(num, precision)
     precision = precision or 1
     return tonumber(string.format(tostring("%." .. precision .. "f"), num))
