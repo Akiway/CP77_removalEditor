@@ -13,6 +13,7 @@ local PATH = "data/config.json"
 ---@field public activeTab integer Tab the window opens on
 ---@field public settingsSection integer Settings page the tab opens on
 ---@field public settingsSidebarWidth number Width of the settings sidebar, unscaled
+---@field public commentedListHeight number Height of the list of nodes commented out in the Edit tab, unscaled
 local settingsData = {
     directAdd = true,
     deleteConfirm = true,
@@ -24,7 +25,8 @@ local settingsData = {
     activeTab = 1,
 
     settingsSection = 1,
-    settingsSidebarWidth = 150
+    settingsSidebarWidth = 150,
+    commentedListHeight = 160
 }
 
 ---@param source table

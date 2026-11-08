@@ -4,6 +4,7 @@ local utils = require("modules/utils/utils")
 local yaml = require("modules/utils/yaml")
 local logger = require("modules/utils/logger")
 local settings = require("modules/utils/settings")
+local commentedNodes = require("modules/utils/commentedNodes")
 
 local DATA = "data/"
 local INSTALL_PATH = "bin\\x64\\plugins\\cyber_engine_tweaks\\mods\\removalEditor\\data\\%s"
@@ -50,6 +51,12 @@ local function loadPreset(name)
     end
     if preset == nil then return nil, "empty" end
 
+    -- Every sector commented out by ArchiveXL Sector Updater: "sectors:" is left without a value
+    if type(preset) == "table" and type(preset.streaming) == "table" and preset.streaming.sectors == nil
+        and yaml.hasCommentedEntries(preset.streaming) then
+        preset.streaming.sectors = {}
+    end
+
     if type(preset) ~= "table" or type(preset.streaming) ~= "table" or type(preset.streaming.sectors) ~= "table" then
         return nil, "no streaming.sectors list"
     end
@@ -70,7 +77,7 @@ local function loadPreset(name)
         end
     end
 
-    return preset, { format = format }
+    return preset, { format = format, commented = commentedNodes.find(preset) }
 end
 
 --- The opened preset, nil if none
@@ -88,6 +95,13 @@ end
 ---@return boolean
 function presets.isYaml(name)
     return (presets.info[name] or {}).format == "yaml"
+end
+
+--- The nodes of a preset that ArchiveXL Sector Updater commented out, read when the preset was loaded
+---@param name string
+---@return commentedNode[]
+function presets.getCommented(name)
+    return (presets.info[name] or {}).commented or {}
 end
 
 --- Writes a preset to its file, in the format it was read in (new presets are YAML). A YAML preset keeps its comments.

@@ -4,6 +4,7 @@ local settings = require("modules/utils/settings")
 local logger = require("modules/utils/logger")
 local presets = require("modules/utils/presets")
 local removals = require("modules/utils/removals")
+local commentedNodes = require("modules/utils/commentedNodes")
 local rht = require("modules/utils/rhtPlugin")
 local style = require("modules/ui/style")
 local presetsUI = require("modules/ui/presetsUI")
@@ -212,6 +213,126 @@ local function drawRemoval(preset, sector, entry)
     return true
 end
 
+-- Icon and color of each status of a node commented out
+local STATUS_LOOKS = {
+    notFound = { icon = IconGlyphs.CloseCircleOutline, color = style.errorColor },
+    mismatch = { icon = IconGlyphs.AlertOutline, color = style.warnColor },
+    moved = { icon = IconGlyphs.ArrowRightCircleOutline, color = style.mutedColor },
+    commented = { icon = IconGlyphs.CommentOutline, color = style.mutedColor }
+}
+
+---@param node commentedNode
+---@return boolean
+local function isCommentedSearched(node)
+    if editUI.searchText == "" then return true end
+
+    local text = table.concat({ tostring(node.sectorPath or ""), tostring(node.index), tostring(node.type or ""),
+        tostring(node.debugName or ""), tostring(node.resource or ""), tostring(node.note or ""),
+        commentedNodes.getStatus(node.status).label, table.concat(node.notes, "\n") }, "\n")
+    return utils.matchSearchPlain(text, editUI.searchText)
+end
+
+---@param node commentedNode
+local function drawCommentedNode(node)
+    local status = commentedNodes.getStatus(node.status)
+    local looks = STATUS_LOOKS[node.status] or STATUS_LOOKS.commented
+
+    style.styledText(looks.icon, looks.color)
+    style.tooltip(status.label)
+    ImGui.SameLine()
+
+    local sector = node.sectorPath and utils.getSectorName(node.sectorPath) or "?"
+    local label = string.format("%s | %s | %s", node.type or "?", sector, tostring(node.index))
+    if not ImGui.TreeNodeEx("##commentedNode", ImGuiTreeNodeFlags.SpanFullWidth, label) then return end
+
+    local valueX = style.getPropertiesX({ "Status", "Reason", "List", "Sector Path", "Node Index", "Type", "Debug Name",
+        "Resource", "NodeRef", "Position", "Note", "Actors / Instances" })
+
+    style.drawProp("Status", status.label, valueX)
+    style.wrappedTooltip(status.description)
+    if #node.notes > 0 then
+        style.drawProp("Reason", table.concat(node.notes, "\n"), valueX)
+    end
+    style.drawProp("List", node.kind == "nodeMutations" and "Mutation" or "Removal", valueX)
+    style.drawProp("Sector Path", node.sectorPath, valueX)
+    style.drawProp("Node Index", node.index, valueX)
+    style.drawProp("Type", node.type, valueX)
+
+    local function isText(value) return (type(value) == "string" and value ~= "") or type(value) == "number" end
+    if isText(node.debugName) then style.drawProp("Debug Name", node.debugName, valueX) end
+    if isText(node.resource) then style.drawProp("Resource", node.resource, valueX) end
+    if isText(node.nodeRef) then style.drawProp("NodeRef", node.nodeRef, valueX) end
+
+    local position = node.position or {}
+    local x, y, z = position.x or position[1], position.y or position[2], position.z or position[3]
+    if type(x) == "number" and type(y) == "number" and type(z) == "number" then
+        style.drawProp("Position", string.format("X: %.2f Y: %.2f Z: %.2f", x, y, z), valueX)
+    end
+    if isText(node.note) then style.drawProp("Note", node.note, valueX) end
+    if node.elements > 0 then style.drawProp("Actors / Instances", node.elements, valueX) end
+
+    ImGui.TreePop()
+    ImGui.Spacing()
+end
+
+-- Divider under the list of nodes commented out
+local commentedDivider = { hovered = false, dragging = false }
+
+--- The nodes of the preset ArchiveXL Sector Updater commented out (ArchiveXL ignores them), filtered by the search
+local function drawCommentedSection()
+    local nodes = presets.getCommented(presets.currentFile)
+    if #nodes == 0 then return end
+
+    local shown = {}
+    for _, node in ipairs(nodes) do
+        if isCommentedSearched(node) then shown[#shown + 1] = node end
+    end
+
+    style.sectionHeaderStart("COMMENTED OUT BY AXLSU", "Nodes ArchiveXL Sector Updater could not convert to the game version, and commented out with the reason.\nArchiveXL ignores them: they are not removed. The search of the removals below filters them too.")
+
+    local count = #shown == #nodes and string.format("%d node%s", #nodes, #nodes == 1 and "" or "s")
+        or string.format("%d / %d nodes", #shown, #nodes)
+    local summary = #shown > 0 and (" (" .. commentedNodes.summary(shown) .. ")") or ""
+
+    style.pushStyleColor(commentedNodes.needsAttention(shown), ImGuiCol.Text, style.warnColor)
+    local open = ImGui.TreeNodeEx(count .. summary .. "###commentedNodes", ImGuiTreeNodeFlags.SpanFullWidth)
+    style.popStyleColor(commentedNodes.needsAttention(shown))
+
+    if open then
+        -- The height the divider under it was dragged to, within what leaves the removals some room
+        local _, available = ImGui.GetContentRegionAvail()
+        local minHeight = ImGui.GetFrameHeightWithSpacing() * 2
+        local maxHeight = math.max(minHeight, available - ImGui.GetFrameHeightWithSpacing() * 6)
+        local height = math.max(minHeight, math.min((tonumber(settings.commentedListHeight) or 160) * style.viewSize, maxHeight))
+        settings.commentedListHeight = height / style.viewSize
+
+        ImGui.BeginChild("##commentedNodes", -1, height)
+
+        for i, node in ipairs(shown) do
+            ImGui.PushID(i)
+            drawCommentedNode(node)
+            ImGui.PopID()
+        end
+        if #shown == 0 then
+            style.mutedText("No commented out node matches the search.")
+        end
+
+        ImGui.EndChild()
+        ImGui.TreePop()
+
+        -- Out of the tree node, so that it is as wide as the section it resizes.
+        -- Dragged to resize the list, double-clicked to put it back to its default height.
+        style.dragSetting("##commentedNodesDivider", "horizontal", nil, commentedDivider, {
+            settings = settings,
+            key = "commentedListHeight",
+            default = settings.getDefault("commentedListHeight")
+        })
+        style.tooltip("Drag to resize the list, double-click to reset it")
+    end
+
+    style.sectionHeaderEnd()
+end
+
 --- The removals of the preset the search matches
 ---@param preset table
 ---@return {sector: table, entry: removalEntry}[]
@@ -298,7 +419,13 @@ function editUI.draw()
     end
 
     style.sectionHeaderStart("PRESET")
-    style.drawProp("Name", utils.removeExtension(presets.currentFile))
+    local commented = presets.getCommented(presets.currentFile)
+    local valueX = style.getPropertiesX({ "Name", "Commented Out" })
+    style.drawProp("Name", utils.removeExtension(presets.currentFile), valueX)
+    if #commented > 0 then
+        style.drawProp("Commented Out", string.format("%d (%s)", #commented, commentedNodes.summary(commented)), valueX)
+        style.wrappedTooltip(presetsUI.getCommentedTooltip(commented))
+    end
     presetsUI.drawVersionWarning(presets.currentFile, preset)
     style.sectionHeaderEnd()
 
@@ -333,6 +460,8 @@ function editUI.draw()
         drawStagedNode()
         style.sectionHeaderEnd()
     end
+
+    drawCommentedSection()
 
     style.sectionHeaderStart("REMOVALS")
 

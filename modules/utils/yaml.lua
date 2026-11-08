@@ -305,25 +305,80 @@ local function commentedEntryStart(text)
     return spaces and #spaces
 end
 
+-- The comment ArchiveXL Sector Updater writes above what it commented out, with the reason
+local function isUpdaterNote(text)
+    return text:match("^#%s*axl_sector_updater:") ~= nil
+end
+
+-- Lists that ArchiveXL Sector Updater comments out with their key, once none of their entries is left
+local commentedKeys = { nodeDeletions = true, nodeMutations = true, sectors = true }
+
+local function isCommentedKey(text)
+    local key = text:match("^# ([%w_]+):%s*$")
+    return key ~= nil and commentedKeys[key] == true
+end
+
+--[[ Entries commented out
+ArchiveXL Sector Updater comments a node out where it was, by writing "# " at the column of its "- ", above the lines
+"# axl_sector_updater: <reason>":
+        # axl_sector_updater: not found in 2.5
+        # - index: 41
+        #   type: worldStaticDecalNode
+A whole sector is commented out the same way, its keys and the nodes it held (already commented out) more indented.
+Removing that "# " gives the lines back as they were.
+]]
+
+--- The groups of lines that are entries commented out: { first, last }, the notes of ArchiveXL Sector Updater just
+--- before them included. An entry goes on over the lines more indented than its "#", or at its column when they go on
+--- with it ("#   type: ..."), are another entry or a note.
+---@param lines table
+---@return table[]
+local function findCommentedRuns(lines)
+    local runs = {}
+    local i = 1
+
+    while i <= #lines do
+        local line = lines[i]
+        if line.text ~= "" and (commentedEntryStart(line.text) or isCommentedKey(line.text)) then
+            local col = line.col or 0
+            local spaces = #line.text:match("^#( *)")
+
+            local first = i
+            while first > 1 and lines[first - 1].text ~= "" and isUpdaterNote(lines[first - 1].text)
+                and (lines[first - 1].col or 0) == col do
+                first = first - 1
+            end
+
+            local last = i
+            local j = i + 1
+            while j <= #lines do
+                local nextLine = lines[j]
+                if nextLine.text ~= "" then
+                    local nextCol = nextLine.col or 0
+                    local nextSpaces = nextLine.text:match("^#( *)")
+                    local goesOn = nextCol > col or (nextCol == col and (isUpdaterNote(nextLine.text)
+                        or commentedEntryStart(nextLine.text) ~= nil or (nextSpaces ~= nil and #nextSpaces > spaces)))
+                    if not goesOn then break end
+                    last = j
+                end
+                j = j + 1
+            end
+
+            runs[#runs + 1] = { first = first, last = last }
+            i = last + 1
+        else
+            i = i + 1
+        end
+    end
+
+    return runs
+end
+
 --- The lines of a group that are entries commented out, with the comments before them
 local function keptLines(lines)
     local last = 0
-    local itemSpaces = nil
-
-    for i, line in ipairs(lines) do
-        local start = commentedEntryStart(line.text)
-        if start then
-            itemSpaces = start
-            last = i
-        elseif itemSpaces then
-            -- Following lines of the entry: more indented after the "#" (e.g. "#   type: ...")
-            local spaces = line.text:match("^#( +)%S")
-            if spaces and #spaces > itemSpaces then
-                last = i
-            else
-                itemSpaces = nil
-            end
-        end
+    for _, run in ipairs(findCommentedRuns(lines)) do
+        last = math.max(last, run.last)
     end
 
     local kept = {}
@@ -349,6 +404,8 @@ local parseBlock
 
 local function parseSequence(state, indent)
     local list = {}
+    -- Column of the collection, from which its comments keep their offset when written back
+    getComments(list).indent = indent
 
     while true do
         local line = state.lines[state.pos]
@@ -395,6 +452,7 @@ local function parseMapping(state, indent)
     local keys = {}
     mappings[map] = true
     keyOrders[map] = keys
+    getComments(map).indent = indent
 
     while true do
         local line = state.lines[state.pos]
@@ -550,6 +608,75 @@ local function isList(tbl)
     return count == size
 end
 
+--- A comment line of an entry commented out, as it was before: its "# " removed when what follows is YAML (a list
+--- item or a key), the notes and other comments left as comments
+---@param line table { text, col }
+---@return string
+local function uncommentLine(line)
+    if line.text == "" or line.text == "#" then return "" end
+
+    local pad = string.rep(" ", line.col or 0)
+    local rest = line.text:match("^# (.*)$")
+
+    if rest and not isUpdaterNote(line.text) then
+        local content = rest:match("^%s*(.-)$")
+        local ok, key = pcall(splitKey, content, 0)
+        if isSequenceItem(content) or (ok and key) then
+            return pad .. rest
+        end
+    end
+
+    return pad .. line.text
+end
+
+--- The entries commented out in the comments of a collection (see Entries commented out), read back as YAML. Each is
+--- { value = the list or mapping they make, nil if they cannot be read, lines = their comment lines }. The notes of
+--- ArchiveXL Sector Updater are the comments of what they are above, those of the first entry the header of value.
+---@param collection table
+---@return table[]
+function yaml.getCommentedEntries(collection)
+    local data = type(collection) == "table" and comments[collection]
+    if not data then return {} end
+
+    local groups = {}
+    for _, anchor in ipairs(data.order) do
+        if data.before[anchor] then groups[#groups + 1] = data.before[anchor] end
+    end
+    groups[#groups + 1] = data.trailing
+
+    local entries = {}
+    for _, lines in ipairs(groups) do
+        for _, run in ipairs(findCommentedRuns(lines)) do
+            local text, raw = {}, {}
+            for i = run.first, run.last do
+                text[#text + 1] = uncommentLine(lines[i])
+                raw[#raw + 1] = lines[i].text
+            end
+
+            local ok, value = pcall(yaml.decode, table.concat(text, "\n"))
+            entries[#entries + 1] = { value = ok and value or nil, lines = raw }
+        end
+    end
+
+    return entries
+end
+
+--- The comment lines before a key of a mapping, or an item of a list
+---@param collection table
+---@param item any
+---@return string[]
+function yaml.getCommentsBefore(collection, item)
+    local data = type(collection) == "table" and comments[collection]
+    if not data then return {} end
+
+    local anchor = isList(collection) and anchorOf(item) or item
+    local lines = {}
+    for _, line in ipairs(data.before[anchor] or {}) do
+        lines[#lines + 1] = line.text
+    end
+    return lines
+end
+
 local function formatString(text)
     if text == "" then return "''" end
 
@@ -641,10 +768,23 @@ local function placeComments(collection, anchors)
     return { before = before, inline = data.inline, trailing = trailing }
 end
 
-local function writeLines(lines, pad, out)
+--- Writes comment lines at the indent of their collection, plus the offset they had from it when read (base: its
+--- column then), so that what is commented out over several levels keeps them
+local function writeLines(lines, pad, out, base)
     for _, line in ipairs(lines or {}) do
-        out[#out + 1] = line.text == "" and "" or pad .. line.text
+        if line.text == "" then
+            out[#out + 1] = ""
+        else
+            local offset = (base and line.col) and math.max(0, line.col - base) or 0
+            out[#out + 1] = pad .. string.rep(" ", offset) .. line.text
+        end
     end
+end
+
+--- Column a collection was read at, nil for one that was not read from YAML
+local function readIndent(collection)
+    local data = comments[collection]
+    return data and data.indent
 end
 
 local function withInline(text, inline)
@@ -660,7 +800,7 @@ local function emitValue(head, item, indent, out, priority, inline)
     elseif next(item) == nil then
         out[#out + 1] = withInline(head .. " " .. (isList(item) and "[]" or "{}"), inline)
         -- An empty collection keeps its comments (e.g. a list whose entries are all commented out)
-        writeLines(placeComments(item, {}).trailing, string.rep(" ", indent + 2), out)
+        writeLines(placeComments(item, {}).trailing, string.rep(" ", indent + 2), out, readIndent(item))
     else
         out[#out + 1] = withInline(head, inline)
         emit(item, indent + 2, out, priority)
@@ -669,6 +809,7 @@ end
 
 emit = function(value, indent, out, priority)
     local pad = string.rep(" ", indent)
+    local base = readIndent(value)
 
     if isList(value) then
         local anchors = {}
@@ -676,7 +817,7 @@ emit = function(value, indent, out, priority)
         local placed = placeComments(value, anchors)
 
         for i, item in ipairs(value) do
-            writeLines(placed.before[anchors[i]], pad, out)
+            writeLines(placed.before[anchors[i]], pad, out, base)
             local inline = placed.inline[anchors[i]]
             if type(item) == "table" and next(item) ~= nil then
                 -- First line of the item after its "- ", unless it is a comment
@@ -693,7 +834,7 @@ emit = function(value, indent, out, priority)
             end
         end
 
-        writeLines(placed.trailing, pad, out)
+        writeLines(placed.trailing, pad, out, base)
         return
     end
 
@@ -701,11 +842,11 @@ emit = function(value, indent, out, priority)
     local placed = placeComments(value, keys)
 
     for _, key in ipairs(keys) do
-        writeLines(placed.before[key], pad, out)
+        writeLines(placed.before[key], pad, out, base)
         emitValue(pad .. formatString(tostring(key)) .. ":", value[key], indent, out, priority, placed.inline[key])
     end
 
-    writeLines(placed.trailing, pad, out)
+    writeLines(placed.trailing, pad, out, base)
 end
 
 --- Writes data as YAML, with the comments it was read with

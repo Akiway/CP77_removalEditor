@@ -2,6 +2,7 @@
 local utils = require("modules/utils/utils")
 local settings = require("modules/utils/settings")
 local presets = require("modules/utils/presets")
+local commentedNodes = require("modules/utils/commentedNodes")
 local style = require("modules/ui/style")
 
 local DELETE_POPUP = "Delete preset?"
@@ -93,15 +94,47 @@ local function drawDeletePopup()
     ImGui.EndPopup()
 end
 
+--- What the commented out nodes of a preset are, for its tooltips
+---@param nodes commentedNode[]
+---@return string
+function presetsUI.getCommentedTooltip(nodes)
+    return string.format("%d node%s commented out by ArchiveXL Sector Updater: %s.\nArchiveXL ignores them. They are listed in the Edit tab, with the reason.",
+        #nodes, #nodes == 1 and "" or "s", commentedNodes.summary(nodes))
+end
+
+--- The number of nodes commented out, on the right of the header of the preset
+---@param nodes commentedNode[]
+local function drawCommentedBadge(nodes)
+    local text = IconGlyphs.CommentAlertOutline .. " " .. #nodes
+    local right = ImGui.GetWindowContentRegionMax()
+
+    ImGui.SameLine(right - ImGui.CalcTextSize(text))
+    style.styledText(text, commentedNodes.needsAttention(nodes) and style.warnColor or style.mutedColor)
+
+    -- The header under it takes the hover: the rectangle of the text is read instead
+    local minX, minY = ImGui.GetItemRectMin()
+    local maxX, maxY = ImGui.GetItemRectMax()
+    style.wrappedTooltipHovered(ImGui.IsMouseHoveringRect(minX, minY, maxX, maxY), presetsUI.getCommentedTooltip(nodes))
+end
+
 ---@param name string
 ---@param preset table
 local function drawPreset(name, preset)
-    if not ImGui.TreeNodeEx(utils.removeExtension(name) .. "##" .. name, ImGuiTreeNodeFlags.SpanFullWidth) then return end
+    local commented = presets.getCommented(name)
+    local open = ImGui.TreeNodeEx(utils.removeExtension(name) .. "##" .. name, ImGuiTreeNodeFlags.SpanFullWidth)
+    if #commented > 0 then
+        drawCommentedBadge(commented)
+    end
+    if not open then return end
 
-    local valueX = style.getPropertiesX({ "Sectors", "Removals", "Mutations", "Game Version", "Format" })
+    local valueX = style.getPropertiesX({ "Sectors", "Removals", "Mutations", "Commented Out", "Game Version", "Format" })
     style.drawProp("Sectors", #preset.streaming.sectors, valueX)
     style.drawProp("Removals", utils.getTotalRemovals(preset), valueX)
     style.drawProp("Mutations", utils.getTotalMutations(preset), valueX)
+    if #commented > 0 then
+        style.drawProp("Commented Out", string.format("%d (%s)", #commented, commentedNodes.summary(commented)), valueX)
+        style.wrappedTooltip(presetsUI.getCommentedTooltip(commented))
+    end
     style.drawProp("Game Version", presets.getGameVersion(preset) or "unknown", valueX)
     style.drawProp("Format", presets.isYaml(name) and "YAML" or "JSON", valueX)
 

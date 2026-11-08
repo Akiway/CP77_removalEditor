@@ -342,7 +342,8 @@ local function cleanupPreset(preset)
         end
 
         -- A sector whose YAML still lists entries commented out (e.g. by ArchiveXL Sector Updater) is kept with them
-        if #sector.nodeDeletions == 0 and #sector.nodeMutations == 0
+        -- or a whole list commented out with its key ("# nodeDeletions:"), which is in the comments of the sector itself
+        if #sector.nodeDeletions == 0 and #sector.nodeMutations == 0 and not yaml.hasCommentedEntries(sector)
             and not yaml.hasCommentedEntries(sector.nodeDeletions) and not yaml.hasCommentedEntries(sector.nodeMutations) then
             table.remove(preset.streaming.sectors, sectorKey)
         end

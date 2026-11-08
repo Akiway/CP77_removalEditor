@@ -50,6 +50,14 @@ Here you can create a new preset by entering a name in the `Name...` field and h
   (`Install anyway`)
 - Convert such presets with [ArchiveXL Sector Updater](https://github.com/Akiway/ArchiveXL-Sector-Updater), then
   check them and hit `Mark as made for <version>` (YAML presets), which writes that comment
+### Nodes commented out by ArchiveXL Sector Updater
+- ArchiveXL Sector Updater comments out the nodes it could not convert (`not found`, `source mismatch`), or that it
+  moved to another sector, under a `# axl_sector_updater: <reason>` line. ArchiveXL ignores them
+- Removal Editor reads them back: a preset that has some shows their number on the right of its header in the
+  `Presets` tab (orange when some are not found or do not match, grey when they all moved), and the reasons in its
+  details. The `Edit` tab lists them in `COMMENTED OUT BY AXLSU`, with their reason, sector, index and what they
+  were. The search of the removals filters them too
+- They are kept as they are when the preset is saved, even a whole sector or a whole list commented out
 ## Edit Tab
 - Here you can see what nodes the preset removes
 - You can add a node to an opened preset directly, by identifying the node in RHT, then pressing the
