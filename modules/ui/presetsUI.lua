@@ -102,32 +102,135 @@ function presetsUI.getCommentedTooltip(nodes)
         #nodes, #nodes == 1 and "" or "s", commentedNodes.summary(nodes))
 end
 
---- The number of nodes commented out, on the right of the header of the preset
----@param nodes commentedNode[]
-local function drawCommentedBadge(nodes)
-    local text = IconGlyphs.CommentAlertOutline .. " " .. #nodes
-    local right = ImGui.GetWindowContentRegionMax()
+-- The columns of the list, on the right of the name of each preset
+local COLUMNS = {
+    { key = "commented", header = "Ignored", tooltip = "Nodes commented out by ArchiveXL Sector Updater (ArchiveXL ignores them).\nOrange when some were not found or do not match, grey when they all moved." },
+    { key = "version", header = "Game Version", tooltip = "Game version the preset was made for, orange when it is not the running one." },
+    { key = "format", header = "Format", tooltip = "Format of the .xl file." }
+}
 
-    ImGui.SameLine(right - ImGui.CalcTextSize(text))
-    style.styledText(text, commentedNodes.needsAttention(nodes) and style.warnColor or style.mutedColor)
+--- What the columns of a preset show
+---@param name string
+---@param preset table
+---@return table<string, {text: string, color: number?, tooltip: string?}>
+local function getCells(name, preset)
+    local cells = {}
 
-    -- The header under it takes the hover: the rectangle of the text is read instead
-    local minX, minY = ImGui.GetItemRectMin()
-    local maxX, maxY = ImGui.GetItemRectMax()
-    style.wrappedTooltipHovered(ImGui.IsMouseHoveringRect(minX, minY, maxX, maxY), presetsUI.getCommentedTooltip(nodes))
+    local commented = presets.getCommented(name)
+    if #commented > 0 then
+        cells.commented = {
+            text = IconGlyphs.CommentAlertOutline .. " " .. #commented,
+            color = commentedNodes.needsAttention(commented) and style.warnColor or style.mutedColor,
+            tooltip = presetsUI.getCommentedTooltip(commented)
+        }
+    else
+        cells.commented = { text = "-", color = style.mutedColor }
+    end
+
+    local version = presets.getGameVersion(preset)
+    if presets.getOutdatedVersion(preset) then
+        cells.version = {
+            text = version and (IconGlyphs.AlertOutline .. " " .. version) or IconGlyphs.HelpRhombusOutline,
+            color = style.warnColor,
+            tooltip = version and string.format("Made for %s, the game is %s: node indices may have changed.", version, presets.gameVersion)
+                or "Game version unknown: if this preset was made before " .. presets.gameVersion .. ", its node indices are probably wrong."
+        }
+    else
+        cells.version = {
+            text = version or IconGlyphs.HelpRhombusOutline,
+            color = version == nil and style.mutedColor or nil,
+            tooltip = version == nil and "Game version unknown" or nil
+        }
+    end
+
+    cells.format = { text = presets.isYaml(name) and "YAML" or "JSON" }
+
+    return cells
+end
+
+--- Where each column starts, in screen coordinates, from the right edge of the list
+---@param rows table[] Cells of each preset
+---@param right number
+---@return table<string, number>, number Column starts, and the space between columns
+local function getColumnsX(rows, right)
+    local gap = 20 * style.viewSize
+    local xs = {}
+
+    for i = #COLUMNS, 1, -1 do
+        local column = COLUMNS[i]
+        local width = ImGui.CalcTextSize(column.header)
+        for _, cells in ipairs(rows) do
+            width = math.max(width, ImGui.CalcTextSize(cells[column.key].text))
+        end
+
+        right = right - width
+        xs[column.key] = right
+        right = right - gap
+    end
+
+    return xs, gap
+end
+
+--- Text on the current line, from screen position x
+---@param x number
+---@param text string
+---@param color number?
+---@param tooltip string?
+local function drawCell(x, text, color, tooltip)
+    ImGui.SameLine()
+    local _, y = ImGui.GetCursorScreenPos()
+    ImGui.SetCursorScreenPos(x, y)
+    style.styledText(text, color)
+
+    if tooltip then
+        -- A header under it takes the hover: the rectangle of the text is read instead
+        local minX, minY = ImGui.GetItemRectMin()
+        local maxX, maxY = ImGui.GetItemRectMax()
+        style.wrappedTooltipHovered(ImGui.IsMouseHoveringRect(minX, minY, maxX, maxY), tooltip)
+    end
+end
+
+--- The header of the list, aligned on the columns of its rows
+---@param left number Screen position of the names
+---@param xs table<string, number>
+local function drawListHeader(left, xs)
+    local _, y = ImGui.GetCursorScreenPos()
+    ImGui.SetCursorScreenPos(left, y)
+    style.mutedText("Name")
+
+    for _, column in ipairs(COLUMNS) do
+        drawCell(xs[column.key], column.header, style.mutedColor, column.tooltip)
+    end
+
+    ImGui.Separator()
 end
 
 ---@param name string
 ---@param preset table
-local function drawPreset(name, preset)
-    local commented = presets.getCommented(name)
-    local open = ImGui.TreeNodeEx(utils.removeExtension(name) .. "##" .. name, ImGuiTreeNodeFlags.SpanFullWidth)
-    if #commented > 0 then
-        drawCommentedBadge(commented)
+---@param cells table
+---@param xs table<string, number>
+---@param gap number
+local function drawPreset(name, preset, cells, xs, gap)
+    -- The name stops before the first column
+    local fullName = utils.removeExtension(name)
+    local labelX = ImGui.GetCursorScreenPos() + ImGui.GetTreeNodeToLabelSpacing()
+    local shownName = style.truncateText(fullName, xs[COLUMNS[1].key] - gap - labelX)
+
+    local open = ImGui.TreeNodeEx(shownName .. "##" .. name, ImGuiTreeNodeFlags.SpanFullWidth)
+    if shownName ~= fullName then
+        local mouseX = ImGui.GetMousePos()
+        style.wrappedTooltipHovered(ImGui.IsItemHovered() and mouseX < xs[COLUMNS[1].key] - gap, fullName)
     end
+
+    for _, column in ipairs(COLUMNS) do
+        local cell = cells[column.key]
+        drawCell(xs[column.key], cell.text, cell.color, cell.tooltip)
+    end
+
     if not open then return end
 
-    local valueX = style.getPropertiesX({ "Sectors", "Removals", "Mutations", "Commented Out", "Game Version", "Format" })
+    local commented = presets.getCommented(name)
+    local valueX = style.getPropertiesX({ "Sectors", "Removals", "Mutations", "Commented Out" })
     style.drawProp("Sectors", #preset.streaming.sectors, valueX)
     style.drawProp("Removals", utils.getTotalRemovals(preset), valueX)
     style.drawProp("Mutations", utils.getTotalMutations(preset), valueX)
@@ -135,8 +238,6 @@ local function drawPreset(name, preset)
         style.drawProp("Commented Out", string.format("%d (%s)", #commented, commentedNodes.summary(commented)), valueX)
         style.wrappedTooltip(presetsUI.getCommentedTooltip(commented))
     end
-    style.drawProp("Game Version", presets.getGameVersion(preset) or "unknown", valueX)
-    style.drawProp("Format", presets.isYaml(name) and "YAML" or "JSON", valueX)
 
     presetsUI.drawVersionWarning(name, preset)
 
@@ -201,10 +302,31 @@ function presetsUI.draw()
     style.sectionHeaderEnd()
     style.sectionHeaderStart("PRESETS")
 
+    local names = presets.getSortedNames()
+    local rows = {}
+    for i, name in ipairs(names) do
+        rows[i] = getCells(name, presets.list[name])
+    end
+
+    -- The header stays above the list when it scrolls. It is drawn before the list, with the edges the list had on
+    -- the last frame (its scrollbar takes some of its width)
+    if #names > 0 then
+        local windowX = ImGui.GetWindowPos()
+        local cursorX = ImGui.GetCursorScreenPos()
+        local left = presetsUI.listLeft or cursorX
+        local right = presetsUI.listRight or (windowX + ImGui.GetWindowContentRegionMax())
+        drawListHeader(left + ImGui.GetTreeNodeToLabelSpacing(), (getColumnsX(rows, right)))
+    end
+
     ImGui.BeginChild("##presets", -1, 0)
 
-    for _, name in ipairs(presets.getSortedNames()) do
-        drawPreset(name, presets.list[name])
+    local childX = ImGui.GetWindowPos()
+    presetsUI.listLeft = ImGui.GetCursorScreenPos()
+    presetsUI.listRight = childX + ImGui.GetWindowContentRegionMax()
+    local xs, gap = getColumnsX(rows, presetsUI.listRight)
+
+    for i, name in ipairs(names) do
+        drawPreset(name, presets.list[name], rows[i], xs, gap)
     end
 
     -- Files that could not be read stay listed, instead of breaking the whole window
