@@ -1,4 +1,6 @@
-config = {}
+-- Same layout as World Builder's modules/utils/config.lua. Reads never raise an error (tryLoadFile, readText),
+-- and text files are kept byte for byte (readText / writeText), which the YAML presets need.
+local config = {}
 
 function config.fileExists(filename)
     local f=io.open(filename,"r")
@@ -7,10 +9,7 @@ end
 
 function config.tryCreateConfig(path, data)
 	if not config.fileExists(path) then
-        local file = io.open(path, "w")
-        local jconfig = json.encode(data)
-        file:write(jconfig)
-        file:close()
+        config.saveFile(path, data)
     end
 end
 
@@ -81,33 +80,23 @@ function config.saveFile(path, data)
     return true
 end
 
-function config.loadPaths(path)
-    local paths = {}
-    file = io.open(path)
-    for line in file:lines() do
-
-        local n = line
-        if string.find(n, "\\") then
-            n = n:match("\\[^\\]*$") -- Everything after last \
+local function recursiveAddMissingKeys(source, target)
+    for k, v in pairs(source) do
+        if type(v) == "table" and type(target[k]) == "table" then
+            recursiveAddMissingKeys(v, target[k])
+        elseif target[k] == nil then
+            target[k] = v
         end
-        n = n:gsub(".ent", ""):gsub("\\", "_") -- Remove .ent, replace \ by _
-        n = n:sub(2)
-
-        table.insert(paths, {path = line, obj = nil, name = n})
-
     end
-    file:close()
-    return paths
 end
 
+--- Adds the keys of data missing from a JSON file (nested ones too), e.g. new settings
+---@param path string
+---@param data table
 function config.backwardComp(path, data)
     local f = config.loadFile(path)
 
-    for k, e in pairs(data) do
-        if f[k] == nil then
-            f[k] = e
-        end
-    end
+    recursiveAddMissingKeys(data, f)
 
     config.saveFile(path, f)
 end
